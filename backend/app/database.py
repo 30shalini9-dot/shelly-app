@@ -649,7 +649,7 @@ def assign_full_marks(evaluation_id: str, question_id: str) -> dict[str, Any]:
     with connection() as conn:
         steps = conn.execute(
             """
-            SELECT qs.id, qs.max_marks
+            SELECT qs.id, qs.step_no, qs.max_marks, q.question_no
             FROM question_steps qs
             JOIN questions q ON q.id = qs.question_id
             JOIN student_submissions s ON s.question_paper_id = q.question_paper_id
@@ -671,8 +671,35 @@ def assign_full_marks(evaluation_id: str, question_id: str) -> dict[str, Any]:
                 DO UPDATE SET awarded_marks = excluded.awarded_marks,
                               updated_at = excluded.updated_at
                 """,
-                (new_id("mark"), evaluation_id, step["id"], step["max_marks"], timestamp),
+                (
+                    new_id("mark"),
+                    evaluation_id,
+                    step["id"],
+                    step["max_marks"],
+                    timestamp,
+                ),
             )
+            conn.execute(
+                """
+                UPDATE answer_annotations
+                SET text = ?, updated_at = ?
+                WHERE evaluation_id = ? AND step_id = ?
+                """,
+                (
+                    f"{step['question_no']} · S{step['step_no']} · "
+                    f"{step['max_marks']:g}/{step['max_marks']:g}",
+                    timestamp,
+                    evaluation_id,
+                    step["id"],
+                ),
+            )
+        conn.execute(
+            """
+            DELETE FROM answer_annotations
+            WHERE evaluation_id = ? AND question_id = ? AND step_id IS NULL
+            """,
+            (evaluation_id, question_id),
+        )
         _touch_evaluation(conn, evaluation_id)
     return get_question(evaluation_id, question_id)
 
@@ -710,6 +737,41 @@ def reset_question(evaluation_id: str, question_id: str) -> dict[str, Any]:
         )
         _touch_evaluation(conn, evaluation_id)
     return get_question(evaluation_id, question_id)
+
+
+def reset_evaluation_marks(evaluation_id: str) -> dict[str, Any]:
+    if not get_evaluation(evaluation_id):
+        raise LookupError("Evaluation was not found")
+    timestamp = now_iso()
+    with connection() as conn:
+        conn.execute(
+            "DELETE FROM evaluation_step_marks WHERE evaluation_id = ?",
+            (evaluation_id,),
+        )
+        conn.execute(
+            "DELETE FROM answer_annotations WHERE evaluation_id = ?",
+            (evaluation_id,),
+        )
+        conn.execute(
+            """
+            UPDATE evaluations
+            SET status = 'Not Started', updated_at = ?, completed_at = NULL
+            WHERE id = ?
+            """,
+            (timestamp, evaluation_id),
+        )
+        conn.execute(
+            """
+            UPDATE student_submissions
+            SET evaluation_status = 'Not Started', updated_at = ?
+            WHERE id = (SELECT submission_id FROM evaluations WHERE id = ?)
+            """,
+            (timestamp, evaluation_id),
+        )
+    progress = get_progress(evaluation_id)
+    if progress is None:
+        raise LookupError("Evaluation was not found")
+    return progress
 
 
 def list_annotations(evaluation_id: str) -> list[dict[str, Any]] | None:
@@ -760,6 +822,14 @@ def create_annotation(
         ).fetchone()
         if not valid:
             raise LookupError("Question, step, or page was not found")
+        if data.get("step_id") is None:
+            conn.execute(
+                """
+                DELETE FROM answer_annotations
+                WHERE evaluation_id = ? AND question_id = ? AND step_id IS NULL
+                """,
+                (evaluation_id, data["question_id"]),
+            )
         annotation_id = new_id("ann")
         timestamp = now_iso()
         conn.execute(

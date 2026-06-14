@@ -43,9 +43,10 @@ interface AiSelection {
   status: "selecting" | "loading";
 }
 
-interface ResizableAnnotationProps {
+interface MarkAnnotationProps {
   annotation: Annotation;
-  onResize: (annotationId: string, width: number, height: number) => void;
+  expanded: boolean;
+  onExpand: () => void;
 }
 
 interface AiNoteCardProps {
@@ -53,6 +54,283 @@ interface AiNoteCardProps {
   onDelete: () => void;
   onSave: () => void;
   saveLabel?: string;
+}
+
+interface QuestionTotalSummary {
+  questionNo: string;
+  steps: Array<{
+    stepNo: number;
+    awarded: number;
+    max: number;
+  }>;
+  awarded: number;
+  max: number;
+}
+
+const TOTAL_ANNOTATION_PREFIX = "T|";
+const LEGACY_TOTAL_ANNOTATION_PREFIX = "TOTAL:";
+
+function formatMark(value: number) {
+  return Number.isInteger(value)
+    ? String(value)
+    : String(Number(value.toFixed(2)));
+}
+
+function serializeQuestionTotal(question: Question) {
+  const steps = (question.steps || [])
+    .map(
+      (step) =>
+        `${formatMark(step.awarded_marks ?? 0)}/${formatMark(step.max_marks)}`,
+    )
+    .join(",");
+  return `${TOTAL_ANNOTATION_PREFIX}${question.question_no}|${steps}|${formatMark(
+    question.awarded_marks,
+  )}/${formatMark(question.max_marks)}`;
+}
+
+function parseQuestionTotal(text: string): QuestionTotalSummary | null {
+  if (text.startsWith(TOTAL_ANNOTATION_PREFIX)) {
+    const [, questionNo, stepText, totalText] = text.split("|");
+    const total = totalText?.split("/").map(Number);
+    const steps = stepText
+      ?.split(",")
+      .filter(Boolean)
+      .map((value, index) => {
+        const [awarded, max] = value.split("/").map(Number);
+        return { stepNo: index + 1, awarded, max };
+      });
+    if (
+      !questionNo ||
+      !steps ||
+      !total ||
+      total.length !== 2 ||
+      steps.some(
+        (step) =>
+          !Number.isFinite(step.awarded) || !Number.isFinite(step.max),
+      ) ||
+      !Number.isFinite(total[0]) ||
+      !Number.isFinite(total[1])
+    ) {
+      return null;
+    }
+    return {
+      questionNo,
+      steps,
+      awarded: total[0],
+      max: total[1],
+    };
+  }
+  if (!text.startsWith(LEGACY_TOTAL_ANNOTATION_PREFIX)) return null;
+  try {
+    const summary = JSON.parse(
+      text.slice(LEGACY_TOTAL_ANNOTATION_PREFIX.length),
+    ) as QuestionTotalSummary;
+    if (
+      !summary.questionNo ||
+      !Array.isArray(summary.steps) ||
+      !Number.isFinite(summary.awarded) ||
+      !Number.isFinite(summary.max)
+    ) {
+      return null;
+    }
+    return summary;
+  } catch {
+    return null;
+  }
+}
+
+function loadExportImage(src: string) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("Unable to load an answer-sheet page."));
+    image.crossOrigin = "anonymous";
+    image.src = src;
+  });
+}
+
+function canvasToJpegBytes(canvas: HTMLCanvasElement) {
+  const dataUrl = canvas.toDataURL("image/jpeg", 0.92);
+  const binary = atob(dataUrl.slice(dataUrl.indexOf(",") + 1));
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+function createImagePdf(
+  pages: Array<{ bytes: Uint8Array; width: number; height: number }>,
+) {
+  const encoder = new TextEncoder();
+  const objects: Uint8Array[] = [];
+  const addObject = (parts: Array<string | Uint8Array>) => {
+    const length = parts.reduce(
+      (total, part) =>
+        total + (typeof part === "string" ? encoder.encode(part).length : part.length),
+      0,
+    );
+    const object = new Uint8Array(length);
+    let offset = 0;
+    for (const part of parts) {
+      const bytes = typeof part === "string" ? encoder.encode(part) : part;
+      object.set(bytes, offset);
+      offset += bytes.length;
+    }
+    objects.push(object);
+    return objects.length;
+  };
+
+  const catalogId = addObject([""]);
+  const pagesId = addObject([""]);
+  const pageIds: number[] = [];
+  for (const page of pages) {
+    const imageId = addObject([
+      `<< /Type /XObject /Subtype /Image /Width ${page.width} /Height ${page.height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${page.bytes.length} >>\nstream\n`,
+      page.bytes,
+      "\nendstream",
+    ]);
+    const content = encoder.encode(
+      `q\n${page.width} 0 0 ${page.height} 0 0 cm\n/Im0 Do\nQ\n`,
+    );
+    const contentId = addObject([
+      `<< /Length ${content.length} >>\nstream\n`,
+      content,
+      "endstream",
+    ]);
+    pageIds.push(
+      addObject([
+        `<< /Type /Page /Parent ${pagesId} 0 R /MediaBox [0 0 ${page.width} ${page.height}] /Resources << /XObject << /Im0 ${imageId} 0 R >> >> /Contents ${contentId} 0 R >>`,
+      ]),
+    );
+  }
+  objects[catalogId - 1] = encoder.encode(
+    `<< /Type /Catalog /Pages ${pagesId} 0 R >>`,
+  );
+  objects[pagesId - 1] = encoder.encode(
+    `<< /Type /Pages /Kids [${pageIds
+      .map((id) => `${id} 0 R`)
+      .join(" ")}] /Count ${pageIds.length} >>`,
+  );
+
+  const chunks: Uint8Array[] = [encoder.encode("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n")];
+  const offsets = [0];
+  let byteOffset = chunks[0].length;
+  objects.forEach((object, index) => {
+    offsets.push(byteOffset);
+    const wrapped = new Uint8Array(
+      encoder.encode(`${index + 1} 0 obj\n`).length +
+        object.length +
+        encoder.encode("\nendobj\n").length,
+    );
+    const prefix = encoder.encode(`${index + 1} 0 obj\n`);
+    const suffix = encoder.encode("\nendobj\n");
+    wrapped.set(prefix);
+    wrapped.set(object, prefix.length);
+    wrapped.set(suffix, prefix.length + object.length);
+    chunks.push(wrapped);
+    byteOffset += wrapped.length;
+  });
+  const xrefOffset = byteOffset;
+  const xref = [
+    `xref\n0 ${objects.length + 1}\n`,
+    "0000000000 65535 f \n",
+    ...offsets
+      .slice(1)
+      .map((offset) => `${String(offset).padStart(10, "0")} 00000 n \n`),
+    `trailer\n<< /Size ${objects.length + 1} /Root ${catalogId} 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`,
+  ].join("");
+  chunks.push(encoder.encode(xref));
+  const pdfBuffer = new ArrayBuffer(
+    chunks.reduce((total, chunk) => total + chunk.length, 0),
+  );
+  const pdfBytes = new Uint8Array(pdfBuffer);
+  let pdfOffset = 0;
+  for (const chunk of chunks) {
+    pdfBytes.set(chunk, pdfOffset);
+    pdfOffset += chunk.length;
+  }
+  return new Blob([pdfBuffer], { type: "application/pdf" });
+}
+
+function drawRoundedRect(
+  context: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  radius: number,
+) {
+  context.beginPath();
+  context.roundRect(x, y, width, height, radius);
+  context.fill();
+  context.stroke();
+}
+
+function drawExportTotal(
+  context: CanvasRenderingContext2D,
+  annotation: Annotation,
+  pageWidth: number,
+  pageHeight: number,
+) {
+  const summary = parseQuestionTotal(annotation.text);
+  if (!summary) return;
+  const scale = Math.max(0.8, pageWidth / 1100);
+  const cardWidth = 172 * scale;
+  const lineHeight = 22 * scale;
+  const padding = 12 * scale;
+  const cardHeight =
+    padding * 2 + lineHeight * (summary.steps.length + 2);
+  const x = Math.min(
+    pageWidth - cardWidth - padding,
+    Math.max(padding, annotation.x * pageWidth),
+  );
+  const y = Math.min(
+    pageHeight - cardHeight - padding,
+    Math.max(padding, annotation.y * pageHeight),
+  );
+
+  context.save();
+  context.fillStyle = "rgba(244, 255, 252, 0.48)";
+  context.strokeStyle = "rgba(7, 116, 108, 0.55)";
+  context.lineWidth = Math.max(1, 1.5 * scale);
+  drawRoundedRect(context, x, y, cardWidth, cardHeight, 10 * scale);
+
+  const left = x + padding;
+  const right = x + cardWidth - padding;
+  let textY = y + padding + lineHeight * 0.72;
+  context.fillStyle = "#17304d";
+  context.font = `700 ${14 * scale}px Arial, sans-serif`;
+  context.textAlign = "left";
+  context.fillText(summary.questionNo, left, textY);
+
+  context.font = `600 ${12 * scale}px Arial, sans-serif`;
+  for (const step of summary.steps) {
+    textY += lineHeight;
+    context.fillStyle = "#075f59";
+    context.textAlign = "left";
+    context.fillText(`S${step.stepNo}`, left, textY);
+    context.textAlign = "right";
+    context.fillText(
+      `${formatMark(step.awarded)}/${formatMark(step.max)}`,
+      right,
+      textY,
+    );
+  }
+
+  textY += lineHeight;
+  context.strokeStyle = "rgba(7, 116, 108, 0.28)";
+  context.beginPath();
+  context.moveTo(left, textY - lineHeight * 0.72);
+  context.lineTo(right, textY - lineHeight * 0.72);
+  context.stroke();
+  context.fillStyle = "#17304d";
+  context.font = `700 ${13 * scale}px Arial, sans-serif`;
+  context.textAlign = "left";
+  context.fillText("Total", left, textY);
+  context.textAlign = "right";
+  context.fillText(
+    `${formatMark(summary.awarded)}/${formatMark(summary.max)}`,
+    right,
+    textY,
+  );
+  context.restore();
 }
 
 function AiNoteCard({
@@ -77,42 +355,181 @@ function AiNoteCard({
   );
 }
 
-function ResizableAnnotation({
+function MarkAnnotation({
   annotation,
-  onResize,
-}: ResizableAnnotationProps) {
-  const labelRef = useRef<HTMLDivElement>(null);
-
-  const saveSize = (event: PointerEvent<HTMLDivElement>) => {
-    event.stopPropagation();
-    const label = labelRef.current;
-    const page = label?.parentElement;
-    if (!label || !page || page.clientWidth === 0 || page.clientHeight === 0) {
-      return;
-    }
-    onResize(
-      annotation.annotation_id,
-      Math.min(1 - annotation.x, label.offsetWidth / page.clientWidth),
-      Math.min(1 - annotation.y, label.offsetHeight / page.clientHeight),
-    );
-  };
+  expanded,
+  onExpand,
+}: MarkAnnotationProps) {
+  const stepLabel = annotation.text.match(/(?:^|\s)S(\d+)(?:\s|·|$)/)?.[1];
 
   return (
-    <div
-      className="answer-annotation"
+    <button
+      aria-expanded={expanded}
+      aria-label={`Open mark details for step ${stepLabel || ""}`.trim()}
+      className={`step-mark-annotation ${expanded ? "expanded" : ""}`}
+      onClick={(event) => {
+        event.stopPropagation();
+        onExpand();
+      }}
       onContextMenu={(event) => event.stopPropagation()}
-      onPointerUp={saveSize}
-      ref={labelRef}
       style={{
         left: `${annotation.x * 100}%`,
         top: `${annotation.y * 100}%`,
-        width: `${annotation.width * 100}%`,
-        height: `${annotation.height * 100}%`,
       }}
-      title="Drag the bottom-right corner to resize this mark label"
+      type="button"
     >
-      {annotation.text}
-    </div>
+      S{stepLabel || "?"}
+      {expanded && (
+        <span className="step-mark-tooltip">{annotation.text}</span>
+      )}
+    </button>
+  );
+}
+
+interface QuestionTotalAnnotationProps {
+  annotation: Annotation;
+  expanded: boolean;
+  onExpand: () => void;
+  onMove: (x: number, y: number) => void;
+}
+
+function QuestionTotalAnnotation({
+  annotation,
+  expanded,
+  onExpand,
+  onMove,
+}: QuestionTotalAnnotationProps) {
+  const summary = parseQuestionTotal(annotation.text);
+  const dragRef = useRef<{
+    pointerId: number;
+    startClientX: number;
+    startClientY: number;
+    startX: number;
+    startY: number;
+    x: number;
+    y: number;
+    moved: boolean;
+  } | null>(null);
+  const suppressClickRef = useRef(false);
+  if (!summary) return null;
+
+  return (
+    <button
+      aria-expanded={expanded}
+      className={`question-total-annotation ${
+        expanded ? "expanded" : "collapsed"
+      }`}
+      onClick={(event) => {
+        event.stopPropagation();
+        if (suppressClickRef.current) {
+          suppressClickRef.current = false;
+          return;
+        }
+        onExpand();
+      }}
+      onContextMenu={(event) => event.stopPropagation()}
+      onPointerCancel={(event) => {
+        event.stopPropagation();
+        dragRef.current = null;
+      }}
+      onPointerDown={(event) => {
+        event.stopPropagation();
+        if (event.button !== 0) return;
+        event.currentTarget.setPointerCapture(event.pointerId);
+        dragRef.current = {
+          pointerId: event.pointerId,
+          startClientX: event.clientX,
+          startClientY: event.clientY,
+          startX: annotation.x,
+          startY: annotation.y,
+          x: annotation.x,
+          y: annotation.y,
+          moved: false,
+        };
+      }}
+      onPointerMove={(event) => {
+        const drag = dragRef.current;
+        const page = event.currentTarget.parentElement;
+        if (
+          !drag ||
+          drag.pointerId !== event.pointerId ||
+          !page ||
+          page.clientWidth === 0 ||
+          page.clientHeight === 0
+        ) {
+          return;
+        }
+        event.stopPropagation();
+        const deltaX = event.clientX - drag.startClientX;
+        const deltaY = event.clientY - drag.startClientY;
+        if (!drag.moved && Math.hypot(deltaX, deltaY) < 4) return;
+        drag.moved = true;
+        const maxX = Math.max(
+          0,
+          1 - event.currentTarget.offsetWidth / page.clientWidth,
+        );
+        const maxY = Math.max(
+          0,
+          1 - event.currentTarget.offsetHeight / page.clientHeight,
+        );
+        drag.x = Math.min(
+          maxX,
+          Math.max(0, drag.startX + deltaX / page.clientWidth),
+        );
+        drag.y = Math.min(
+          maxY,
+          Math.max(0, drag.startY + deltaY / page.clientHeight),
+        );
+        event.currentTarget.style.left = `${drag.x * 100}%`;
+        event.currentTarget.style.top = `${drag.y * 100}%`;
+      }}
+      onPointerUp={(event) => {
+        const drag = dragRef.current;
+        event.stopPropagation();
+        if (!drag || drag.pointerId !== event.pointerId) return;
+        event.currentTarget.releasePointerCapture(event.pointerId);
+        dragRef.current = null;
+        if (drag.moved) {
+          suppressClickRef.current = true;
+          onMove(drag.x, drag.y);
+        }
+      }}
+      style={{
+        left: `${annotation.x * 100}%`,
+        top: `${annotation.y * 100}%`,
+      }}
+      title="Drag to move this total card. Click to expand it for 2.5 seconds."
+      type="button"
+    >
+      {expanded ? (
+        <>
+          <span className="question-total-heading">{summary.questionNo}</span>
+          <span className="question-total-steps">
+            {summary.steps.map((step) => (
+              <span key={step.stepNo}>
+                S{step.stepNo}
+                <strong>
+                  {formatMark(step.awarded)}/{formatMark(step.max)}
+                </strong>
+              </span>
+            ))}
+          </span>
+          <span className="question-total-result">
+            Total
+            <strong>
+              {formatMark(summary.awarded)}/{formatMark(summary.max)}
+            </strong>
+          </span>
+        </>
+      ) : (
+        <>
+          <strong>{summary.questionNo}:</strong>
+          <span>
+            {formatMark(summary.awarded)}/{formatMark(summary.max)}
+          </span>
+        </>
+      )}
+    </button>
   );
 }
 
@@ -136,6 +553,10 @@ export function EvaluationWorkspace({
   const [rightWidth, setRightWidth] = useState(300);
   const [resizingRight, setResizingRight] = useState(false);
   const [menu, setMenu] = useState<MarkMenuState | null>(null);
+  const [expandedMarkId, setExpandedMarkId] = useState<string | null>(null);
+  const [expandedTotalIds, setExpandedTotalIds] = useState<Set<string>>(
+    new Set(),
+  );
   const [toolMode, setToolMode] = useState<"ai-select" | null>(null);
   const [aiSelection, setAiSelectionState] = useState<AiSelection | null>(null);
   const [questionCursor, setQuestionCursor] = useState({
@@ -144,11 +565,17 @@ export function EvaluationWorkspace({
     visible: false,
   });
   const [notice, setNotice] = useState("");
+  const [markingWarning, setMarkingWarning] = useState("");
+  const [actionMenuOpen, setActionMenuOpen] = useState(false);
+  const [resetPaperOpen, setResetPaperOpen] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+  const [resettingPaper, setResettingPaper] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
   const [loading, setLoading] = useState(true);
-  const pagesRef = useRef<Page[]>([]);
-  const pageRefs = useRef(new Map<string, HTMLDivElement>());
   const aiSelectionRef = useRef<AiSelection | null>(null);
   const rightPanelRef = useRef<HTMLElement>(null);
+  const totalTimersRef = useRef(new Map<string, number>());
+  const markingWarningTimerRef = useRef<number | null>(null);
 
   const setAiSelection = (selection: AiSelection | null) => {
     aiSelectionRef.current = selection;
@@ -173,7 +600,6 @@ export function EvaluationWorkspace({
     ]);
     setEvaluation(evaluationData);
     setPages(pageData);
-    pagesRef.current = pageData;
     setQuestions(questionData);
     setProgress(progressData);
     setAnnotations(annotationData);
@@ -185,6 +611,7 @@ export function EvaluationWorkspace({
     async (questionId: string) => {
       setNotice("");
       setMenu(null);
+      setExpandedMarkId(null);
       setToolMode(null);
       setAiSelection(null);
       const detail = await api<Question>(
@@ -192,13 +619,6 @@ export function EvaluationWorkspace({
         { method: "PATCH" },
       );
       setQuestion(detail);
-      if (detail.page_id) {
-        requestAnimationFrame(() => {
-          pageRefs.current
-            .get(detail.page_id!)
-            ?.scrollIntoView({ behavior: "smooth", block: "start" });
-        });
-      }
       const [questionData, progressData] = await Promise.all([
         api<Question[]>(`/evaluations/${evaluationId}/questions`),
         api<Progress>(`/evaluations/${evaluationId}/progress`),
@@ -225,6 +645,16 @@ export function EvaluationWorkspace({
     rightPanelRef.current?.scrollTo({ top: 0 });
   }, [question?.question_id]);
 
+  useEffect(
+    () => () => {
+      totalTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+      if (markingWarningTimerRef.current) {
+        window.clearTimeout(markingWarningTimerRef.current);
+      }
+    },
+    [],
+  );
+
   useEffect(() => {
     if (!resizingRight) return undefined;
     const resize = (event: globalThis.PointerEvent) => {
@@ -245,6 +675,20 @@ export function EvaluationWorkspace({
     if (!question?.steps?.length) return null;
     return question.steps.find((step) => step.awarded_marks === null) || null;
   }, [question]);
+
+  const showAlreadyMarkedWarning = () => {
+    if (markingWarningTimerRef.current) {
+      window.clearTimeout(markingWarningTimerRef.current);
+    }
+    setMenu(null);
+    setMarkingWarning(
+      `${question?.question_no || "This question"} has already been marked. Right click and Reset the question before marking it again.`,
+    );
+    markingWarningTimerRef.current = window.setTimeout(() => {
+      setMarkingWarning("");
+      markingWarningTimerRef.current = null;
+    }, 3500);
+  };
 
   const refreshQuestionState = async (questionId: string) => {
     const [detail, questionData, progressData, annotationData] =
@@ -270,31 +714,88 @@ export function EvaluationWorkspace({
       : null;
   };
 
-  const saveAnnotation = async (step: Step, marks: number) => {
-    if (!question || !menu) return;
+  const expandQuestionTotal = useCallback((annotationId: string) => {
+    const existingTimer = totalTimersRef.current.get(annotationId);
+    if (existingTimer) window.clearTimeout(existingTimer);
+    setExpandedTotalIds((current) => new Set(current).add(annotationId));
+    const timer = window.setTimeout(() => {
+      setExpandedTotalIds((current) => {
+        const next = new Set(current);
+        next.delete(annotationId);
+        return next;
+      });
+      totalTimersRef.current.delete(annotationId);
+    }, 2500);
+    totalTimersRef.current.set(annotationId, timer);
+  }, []);
+
+  const saveStepAnnotation = async (
+    markedQuestion: Question,
+    step: Step,
+    marks: number,
+    placement: MarkMenuState,
+  ) => {
     await api<Annotation>(`/evaluations/${evaluationId}/annotations`, {
       method: "POST",
       body: JSON.stringify({
-        question_id: question.question_id,
+        question_id: markedQuestion.question_id,
         step_id: step.step_id,
-        page_id: menu.pageId,
-        text: `${question.question_no} · S${step.step_no} · ${marks}/${step.max_marks}`,
-        x: menu.pageX,
-        y: menu.pageY,
-        width: 0.2,
-        height: 0.055,
+        page_id: placement.pageId,
+        text: `${markedQuestion.question_no} · S${step.step_no} · ${formatMark(
+          marks,
+        )}/${formatMark(step.max_marks)}`,
+        x: placement.pageX,
+        y: placement.pageY,
+        width: 0.04,
+        height: 0.04,
       }),
     });
   };
 
+  const saveQuestionTotal = async (
+    completedQuestion: Question,
+    placement: MarkMenuState,
+  ) => {
+    const annotation = await api<Annotation>(
+      `/evaluations/${evaluationId}/annotations`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          question_id: completedQuestion.question_id,
+          step_id: null,
+          page_id: placement.pageId,
+          text: serializeQuestionTotal(completedQuestion),
+          x: Math.min(0.82, placement.pageX + 0.045),
+          y: Math.min(0.88, placement.pageY + 0.045),
+          width: 0.18,
+          height: 0.12,
+        }),
+      },
+    );
+    expandQuestionTotal(annotation.annotation_id);
+  };
+
+  const moveToNextQuestion = async (questionId: string) => {
+    const nextId = nextQuestionId(questionId);
+    if (nextId) await selectQuestion(nextId);
+    else setNotice("All questions have been marked.");
+  };
+
   const markStep = async (step: Step, marks: number) => {
-    if (!question) return;
+    if (!question || !menu) return;
+    if (question.status === "Completed") {
+      showAlreadyMarkedWarning();
+      return;
+    }
     if (marks < 0 || marks > step.max_marks) {
       setNotice(`Marks must be between 0 and ${step.max_marks}.`);
       return;
     }
+    const markedQuestion = question;
+    const placement = menu;
     const questionId = question.question_id;
     setNotice("");
+    setMenu(null);
     try {
       const updated = await api<Question>(
         `/evaluations/${evaluationId}/steps/${step.step_id}/marks`,
@@ -303,13 +804,13 @@ export function EvaluationWorkspace({
           body: JSON.stringify({ awarded_marks: marks }),
         },
       );
-      await saveAnnotation(step, marks);
-      setMenu(null);
+      await saveStepAnnotation(markedQuestion, step, marks, placement);
+      if (updated.status === "Completed") {
+        await saveQuestionTotal(updated, placement);
+      }
       await refreshQuestionState(questionId);
       if (updated.status === "Completed") {
-        const nextId = nextQuestionId(questionId);
-        if (nextId) await selectQuestion(nextId);
-        else setNotice("All questions have been marked.");
+        await moveToNextQuestion(questionId);
       }
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Unable to save marks");
@@ -317,9 +818,8 @@ export function EvaluationWorkspace({
   };
 
   const assignQuickMark = (marks: number | "custom") => {
-    if (!activeStep) {
-      setNotice("This question is already complete. Reset it to mark again.");
-      setMenu(null);
+    if (question?.status === "Completed" || !activeStep) {
+      showAlreadyMarkedWarning();
       return;
     }
     if (marks === "custom") {
@@ -388,26 +888,75 @@ export function EvaluationWorkspace({
     }
   };
 
-  const resizeAnnotation = async (
+  const moveQuestionTotal = async (
     annotationId: string,
-    width: number,
-    height: number,
+    x: number,
+    y: number,
   ) => {
     setAnnotations((current) =>
       current.map((annotation) =>
         annotation.annotation_id === annotationId
-          ? { ...annotation, width, height }
+          ? { ...annotation, x, y }
           : annotation,
       ),
     );
     try {
       await api(`/evaluations/${evaluationId}/annotations/${annotationId}`, {
         method: "PATCH",
-        body: JSON.stringify({ width, height }),
+        body: JSON.stringify({ x, y }),
       });
     } catch (error) {
+      const annotationData = await api<Annotation[]>(
+        `/evaluations/${evaluationId}/annotations`,
+      ).catch(() => null);
+      if (annotationData) setAnnotations(annotationData);
       setNotice(
-        error instanceof Error ? error.message : "Unable to resize mark label",
+        error instanceof Error
+          ? error.message
+          : "Unable to move the question total",
+      );
+    }
+  };
+
+  const completeCurrentQuestion = async (mode: "full" | "total") => {
+    if (!question || !menu) return;
+    if (question.status === "Completed") {
+      showAlreadyMarkedWarning();
+      return;
+    }
+    const questionId = question.question_id;
+    const placement = menu;
+    setMenu(null);
+    setNotice("");
+    try {
+      let updated = question;
+      if (mode === "full") {
+        updated = await api<Question>(
+          `/evaluations/${evaluationId}/questions/${questionId}/full-marks`,
+          { method: "POST" },
+        );
+      } else {
+        for (const step of question.steps || []) {
+          if (step.awarded_marks !== null) continue;
+          updated = await api<Question>(
+            `/evaluations/${evaluationId}/steps/${step.step_id}/marks`,
+            {
+              method: "POST",
+              body: JSON.stringify({ awarded_marks: 0 }),
+            },
+          );
+        }
+      }
+      await saveQuestionTotal(updated, placement);
+      await refreshQuestionState(questionId);
+      await moveToNextQuestion(questionId);
+    } catch (error) {
+      setNotice(
+        error instanceof Error
+          ? error.message
+          : mode === "full"
+            ? "Unable to award full marks"
+            : "Unable to total the question",
       );
     }
   };
@@ -621,14 +1170,115 @@ export function EvaluationWorkspace({
 
   const submitEvaluation = async () => {
     setNotice("");
+    setActionMenuOpen(false);
+    setSubmitting(true);
     try {
       await api(`/evaluations/${evaluationId}/submit`, { method: "POST" });
-      setNotice("Evaluation submitted successfully.");
-      await loadOverview();
+      onBack();
     } catch (error) {
       setNotice(
         error instanceof Error ? error.message : "Unable to submit evaluation",
       );
+      setSubmitting(false);
+    }
+  };
+
+  const downloadMarkedAnswerSheet = async () => {
+    setActionMenuOpen(false);
+    setDownloading(true);
+    setNotice("");
+    try {
+      const loadedPages = await Promise.all(
+        pages.map(async (page) => ({
+          page,
+          image: await loadExportImage(`${API_BASE}${page.image_url}`),
+        })),
+      );
+      if (loadedPages.length === 0) {
+        throw new Error("No answer-sheet pages are available to download.");
+      }
+      const pdfPages = loadedPages.map(({ page, image }) => {
+        const canvas = document.createElement("canvas");
+        canvas.width = image.naturalWidth;
+        canvas.height = image.naturalHeight;
+        const context = canvas.getContext("2d");
+        if (!context) {
+          throw new Error("Unable to prepare the answer-sheet download.");
+        }
+        context.fillStyle = "#ffffff";
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        context.drawImage(
+          image,
+          0,
+          0,
+          canvas.width,
+          canvas.height,
+        );
+        annotations
+          .filter(
+            (annotation) =>
+              annotation.page_id === page.page_id &&
+              annotation.step_id === null,
+          )
+          .forEach((annotation) =>
+            drawExportTotal(
+              context,
+              annotation,
+              canvas.width,
+              canvas.height,
+            ),
+          );
+        return {
+          bytes: canvasToJpegBytes(canvas),
+          width: canvas.width,
+          height: canvas.height,
+        };
+      });
+      const blob = createImagePdf(pdfPages);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      const student = (evaluation?.student_name || evaluation?.student_id || "student")
+        .replace(/[^a-z0-9]+/gi, "-")
+        .replace(/^-|-$/g, "")
+        .toLowerCase();
+      link.href = url;
+      link.download = `${student || "student"}-marked-answer-sheet.pdf`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      setNotice("Marked answer sheet downloaded.");
+    } catch (error) {
+      setNotice(
+        error instanceof Error
+          ? error.message
+          : "Unable to download the marked answer sheet",
+      );
+    } finally {
+      setDownloading(false);
+    }
+  };
+
+  const resetQuestionPaper = async () => {
+    setResettingPaper(true);
+    setNotice("");
+    try {
+      await api(`/evaluations/${evaluationId}/marks`, { method: "DELETE" });
+      setResetPaperOpen(false);
+      setAnnotations([]);
+      setExpandedMarkId(null);
+      setExpandedTotalIds(new Set());
+      await loadOverview();
+      if (question) await refreshQuestionState(question.question_id);
+      setNotice("All marks and marking labels were reset.");
+    } catch (error) {
+      setNotice(
+        error instanceof Error
+          ? error.message
+          : "Unable to reset the question paper",
+      );
+    } finally {
+      setResettingPaper(false);
     }
   };
 
@@ -645,7 +1295,11 @@ export function EvaluationWorkspace({
       className={`workspace ${leftOpen ? "" : "left-collapsed"} ${
         rightOpen ? "" : "right-collapsed"
       }`}
-      onClick={() => setMenu(null)}
+      onClick={() => {
+        setMenu(null);
+        setExpandedMarkId(null);
+        setActionMenuOpen(false);
+      }}
       style={workspaceStyle}
     >
       <header className="workspace-header">
@@ -687,13 +1341,63 @@ export function EvaluationWorkspace({
         >
           {progress.status}
         </span>
-        <button
-          className="button-primary submit-button"
-          onClick={submitEvaluation}
-          type="button"
+        <div
+          className="evaluation-actions"
+          onClick={(event) => event.stopPropagation()}
         >
-          Submit evaluation
-        </button>
+          <button
+            className="button-primary submit-button"
+            disabled={submitting}
+            onClick={() => void submitEvaluation()}
+            type="button"
+          >
+            {submitting ? "Submitting…" : "Submit evaluation"}
+          </button>
+          <button
+            aria-expanded={actionMenuOpen}
+            aria-haspopup="menu"
+            aria-label="Open evaluation actions"
+            className="button-primary evaluation-actions-toggle"
+            onClick={() => setActionMenuOpen((open) => !open)}
+            type="button"
+          >
+            ▾
+          </button>
+          {actionMenuOpen && (
+            <div className="evaluation-actions-menu" role="menu">
+              <button
+                disabled={submitting}
+                onClick={() => void submitEvaluation()}
+                role="menuitem"
+                type="button"
+              >
+                <strong>Submit evaluation</strong>
+                <span>Complete and return to dashboard</span>
+              </button>
+              <button
+                disabled={downloading}
+                onClick={() => void downloadMarkedAnswerSheet()}
+                role="menuitem"
+                type="button"
+              >
+                <strong>{downloading ? "Preparing download…" : "Download"}</strong>
+                <span>Answer sheet with question totals</span>
+              </button>
+              <button
+                className="danger"
+                onClick={() => {
+                  setActionMenuOpen(false);
+                  setResetPaperOpen(true);
+                }}
+                role="menuitem"
+                type="button"
+              >
+                <strong>Reset question paper</strong>
+                <span>Delete marks for every question</span>
+              </button>
+            </div>
+          )}
+        </div>
       </header>
 
       <aside className="left-panel side-panel">
@@ -849,10 +1553,6 @@ export function EvaluationWorkspace({
                     onPointerUp={(event) =>
                       finishAiSelection(event, page.page_id)
                     }
-                    ref={(element) => {
-                      if (element) pageRefs.current.set(page.page_id, element);
-                      else pageRefs.current.delete(page.page_id);
-                    }}
                     style={{
                       transform: `rotate(${rotation}deg)`,
                       width: `${zoom * 100}%`,
@@ -864,15 +1564,42 @@ export function EvaluationWorkspace({
                       draggable={false}
                       src={`${API_BASE}${page.image_url}`}
                     />
-                    {pageAnnotations.map((annotation) => (
-                      <ResizableAnnotation
-                        annotation={annotation}
-                        key={annotation.annotation_id}
-                        onResize={(annotationId, width, height) =>
-                          void resizeAnnotation(annotationId, width, height)
-                        }
-                      />
-                    ))}
+                    {pageAnnotations.map((annotation) =>
+                      annotation.step_id === null ? (
+                        <QuestionTotalAnnotation
+                          annotation={annotation}
+                          expanded={expandedTotalIds.has(
+                            annotation.annotation_id,
+                          )}
+                          key={annotation.annotation_id}
+                          onExpand={() =>
+                            expandQuestionTotal(annotation.annotation_id)
+                          }
+                          onMove={(x, y) =>
+                            void moveQuestionTotal(
+                              annotation.annotation_id,
+                              x,
+                              y,
+                            )
+                          }
+                        />
+                      ) : (
+                        <MarkAnnotation
+                          annotation={annotation}
+                          expanded={
+                            expandedMarkId === annotation.annotation_id
+                          }
+                          key={annotation.annotation_id}
+                          onExpand={() =>
+                            setExpandedMarkId((current) =>
+                              current === annotation.annotation_id
+                                ? null
+                                : annotation.annotation_id,
+                            )
+                          }
+                        />
+                      ),
+                    )}
                     {pageAiNotes.map((note) => (
                       <div
                         className={`ai-note-marker ${
@@ -1094,28 +1821,44 @@ export function EvaluationWorkspace({
           ) : (
             <div className="context-complete-message">Question completed</div>
           )}
-          <button
-            className="context-wide context-ai"
-            onClick={() => {
-              setMenu(null);
-              if (pendingAiNote) {
-                setNotice("Save or delete the current AI Vision note first.");
-                return;
-              }
-              setToolMode("ai-select");
-              setNotice("Drag a rectangle over the answer for AI Vision.");
-            }}
-            type="button"
-          >
-            AI Vision selection
-          </button>
-          <button
-            className="context-wide context-danger"
-            onClick={() => void resetCurrentQuestion()}
-            type="button"
-          >
-            Delete marks and reset question
-          </button>
+          <div className="context-action-grid">
+            <button
+              className="context-ai"
+              onClick={() => {
+                setMenu(null);
+                if (pendingAiNote) {
+                  setNotice("Save or delete the current AI Vision note first.");
+                  return;
+                }
+                setToolMode("ai-select");
+                setNotice("Drag a rectangle over the answer for AI Vision.");
+              }}
+              type="button"
+            >
+              AI Vision
+            </button>
+            <button
+              className="context-success"
+              onClick={() => void completeCurrentQuestion("full")}
+              type="button"
+            >
+              Full marks
+            </button>
+            <button
+              className="context-danger"
+              onClick={() => void resetCurrentQuestion()}
+              type="button"
+            >
+              Reset question
+            </button>
+            <button
+              className="context-total"
+              onClick={() => void completeCurrentQuestion("total")}
+              type="button"
+            >
+              Do total
+            </button>
+          </div>
           <div className="context-nav">
             <button onClick={() => navigateQuestion(-1)} type="button">
               ← Previous
@@ -1128,6 +1871,61 @@ export function EvaluationWorkspace({
       )}
 
       {notice && <div className="toast">{notice}</div>}
+      {resetPaperOpen && (
+        <div
+          aria-labelledby="reset-paper-title"
+          aria-modal="true"
+          className="confirmation-backdrop"
+          role="dialog"
+        >
+          <div className="confirmation-dialog">
+            <strong id="reset-paper-title">Reset the entire question paper?</strong>
+            <p>
+              This will permanently delete all awarded marks and marking labels
+              for every question. The uploaded answer sheet will remain.
+            </p>
+            <div>
+              <button
+                className="button-ghost"
+                disabled={resettingPaper}
+                onClick={() => setResetPaperOpen(false)}
+                type="button"
+              >
+                Cancel
+              </button>
+              <button
+                className="button-danger"
+                disabled={resettingPaper}
+                onClick={() => void resetQuestionPaper()}
+                type="button"
+              >
+                {resettingPaper ? "Resetting…" : "Reset question paper"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {markingWarning && (
+        <div className="marking-warning-popup" role="alert">
+          <div>
+            <strong>Question already marked</strong>
+            <span>{markingWarning}</span>
+          </div>
+          <button
+            aria-label="Close warning"
+            onClick={() => {
+              if (markingWarningTimerRef.current) {
+                window.clearTimeout(markingWarningTimerRef.current);
+                markingWarningTimerRef.current = null;
+              }
+              setMarkingWarning("");
+            }}
+            type="button"
+          >
+            ×
+          </button>
+        </div>
+      )}
     </main>
   );
 }
