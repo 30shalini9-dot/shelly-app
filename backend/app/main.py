@@ -261,6 +261,13 @@ def create_app(
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    @app.delete("/evaluations/{evaluation_id}/marks")
+    def reset_evaluation_marks(evaluation_id: str) -> dict[str, Any]:
+        try:
+            return database.reset_evaluation_marks(evaluation_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     @app.get("/evaluations/{evaluation_id}/annotations")
     def get_annotations(evaluation_id: str) -> list[dict[str, Any]]:
         annotations = database.list_annotations(evaluation_id)

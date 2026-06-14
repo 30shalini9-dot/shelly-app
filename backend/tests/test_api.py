@@ -344,6 +344,24 @@ class ApiTestCase(unittest.TestCase):
         self.assertEqual(moved_total.json()["x"], 0.55)
         self.assertEqual(moved_total.json()["y"], 0.65)
 
+        reset_paper = self.client.delete(
+            f"/evaluations/{evaluation_id}/marks"
+        )
+        self.assertEqual(reset_paper.status_code, 200)
+        self.assertEqual(reset_paper.json()["status"], "Not Started")
+        self.assertEqual(reset_paper.json()["questions_evaluated"], 0)
+        self.assertEqual(reset_paper.json()["total_marks"], 0)
+        self.assertEqual(
+            self.client.get(f"/evaluations/{evaluation_id}/annotations").json(),
+            [],
+        )
+        reset_question = self.client.get(
+            f"/evaluations/{evaluation_id}/questions/{question['question_id']}"
+        ).json()
+        self.assertTrue(
+            all(step["awarded_marks"] is None for step in reset_question["steps"])
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

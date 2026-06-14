@@ -739,6 +739,41 @@ def reset_question(evaluation_id: str, question_id: str) -> dict[str, Any]:
     return get_question(evaluation_id, question_id)
 
 
+def reset_evaluation_marks(evaluation_id: str) -> dict[str, Any]:
+    if not get_evaluation(evaluation_id):
+        raise LookupError("Evaluation was not found")
+    timestamp = now_iso()
+    with connection() as conn:
+        conn.execute(
+            "DELETE FROM evaluation_step_marks WHERE evaluation_id = ?",
+            (evaluation_id,),
+        )
+        conn.execute(
+            "DELETE FROM answer_annotations WHERE evaluation_id = ?",
+            (evaluation_id,),
+        )
+        conn.execute(
+            """
+            UPDATE evaluations
+            SET status = 'Not Started', updated_at = ?, completed_at = NULL
+            WHERE id = ?
+            """,
+            (timestamp, evaluation_id),
+        )
+        conn.execute(
+            """
+            UPDATE student_submissions
+            SET evaluation_status = 'Not Started', updated_at = ?
+            WHERE id = (SELECT submission_id FROM evaluations WHERE id = ?)
+            """,
+            (timestamp, evaluation_id),
+        )
+    progress = get_progress(evaluation_id)
+    if progress is None:
+        raise LookupError("Evaluation was not found")
+    return progress
+
+
 def list_annotations(evaluation_id: str) -> list[dict[str, Any]] | None:
     if not get_evaluation(evaluation_id):
         return None

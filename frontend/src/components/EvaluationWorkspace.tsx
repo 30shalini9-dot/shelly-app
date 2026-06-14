@@ -139,6 +139,200 @@ function parseQuestionTotal(text: string): QuestionTotalSummary | null {
   }
 }
 
+function loadExportImage(src: string) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("Unable to load an answer-sheet page."));
+    image.crossOrigin = "anonymous";
+    image.src = src;
+  });
+}
+
+function canvasToJpegBytes(canvas: HTMLCanvasElement) {
+  const dataUrl = canvas.toDataURL("image/jpeg", 0.92);
+  const binary = atob(dataUrl.slice(dataUrl.indexOf(",") + 1));
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+function createImagePdf(
+  pages: Array<{ bytes: Uint8Array; width: number; height: number }>,
+) {
+  const encoder = new TextEncoder();
+  const objects: Uint8Array[] = [];
+  const addObject = (parts: Array<string | Uint8Array>) => {
+    const length = parts.reduce(
+      (total, part) =>
+        total + (typeof part === "string" ? encoder.encode(part).length : part.length),
+      0,
+    );
+    const object = new Uint8Array(length);
+    let offset = 0;
+    for (const part of parts) {
+      const bytes = typeof part === "string" ? encoder.encode(part) : part;
+      object.set(bytes, offset);
+      offset += bytes.length;
+    }
+    objects.push(object);
+    return objects.length;
+  };
+
+  const catalogId = addObject([""]);
+  const pagesId = addObject([""]);
+  const pageIds: number[] = [];
+  for (const page of pages) {
+    const imageId = addObject([
+      `<< /Type /XObject /Subtype /Image /Width ${page.width} /Height ${page.height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${page.bytes.length} >>\nstream\n`,
+      page.bytes,
+      "\nendstream",
+    ]);
+    const content = encoder.encode(
+      `q\n${page.width} 0 0 ${page.height} 0 0 cm\n/Im0 Do\nQ\n`,
+    );
+    const contentId = addObject([
+      `<< /Length ${content.length} >>\nstream\n`,
+      content,
+      "endstream",
+    ]);
+    pageIds.push(
+      addObject([
+        `<< /Type /Page /Parent ${pagesId} 0 R /MediaBox [0 0 ${page.width} ${page.height}] /Resources << /XObject << /Im0 ${imageId} 0 R >> >> /Contents ${contentId} 0 R >>`,
+      ]),
+    );
+  }
+  objects[catalogId - 1] = encoder.encode(
+    `<< /Type /Catalog /Pages ${pagesId} 0 R >>`,
+  );
+  objects[pagesId - 1] = encoder.encode(
+    `<< /Type /Pages /Kids [${pageIds
+      .map((id) => `${id} 0 R`)
+      .join(" ")}] /Count ${pageIds.length} >>`,
+  );
+
+  const chunks: Uint8Array[] = [encoder.encode("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n")];
+  const offsets = [0];
+  let byteOffset = chunks[0].length;
+  objects.forEach((object, index) => {
+    offsets.push(byteOffset);
+    const wrapped = new Uint8Array(
+      encoder.encode(`${index + 1} 0 obj\n`).length +
+        object.length +
+        encoder.encode("\nendobj\n").length,
+    );
+    const prefix = encoder.encode(`${index + 1} 0 obj\n`);
+    const suffix = encoder.encode("\nendobj\n");
+    wrapped.set(prefix);
+    wrapped.set(object, prefix.length);
+    wrapped.set(suffix, prefix.length + object.length);
+    chunks.push(wrapped);
+    byteOffset += wrapped.length;
+  });
+  const xrefOffset = byteOffset;
+  const xref = [
+    `xref\n0 ${objects.length + 1}\n`,
+    "0000000000 65535 f \n",
+    ...offsets
+      .slice(1)
+      .map((offset) => `${String(offset).padStart(10, "0")} 00000 n \n`),
+    `trailer\n<< /Size ${objects.length + 1} /Root ${catalogId} 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`,
+  ].join("");
+  chunks.push(encoder.encode(xref));
+  const pdfBuffer = new ArrayBuffer(
+    chunks.reduce((total, chunk) => total + chunk.length, 0),
+  );
+  const pdfBytes = new Uint8Array(pdfBuffer);
+  let pdfOffset = 0;
+  for (const chunk of chunks) {
+    pdfBytes.set(chunk, pdfOffset);
+    pdfOffset += chunk.length;
+  }
+  return new Blob([pdfBuffer], { type: "application/pdf" });
+}
+
+function drawRoundedRect(
+  context: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  radius: number,
+) {
+  context.beginPath();
+  context.roundRect(x, y, width, height, radius);
+  context.fill();
+  context.stroke();
+}
+
+function drawExportTotal(
+  context: CanvasRenderingContext2D,
+  annotation: Annotation,
+  pageWidth: number,
+  pageHeight: number,
+) {
+  const summary = parseQuestionTotal(annotation.text);
+  if (!summary) return;
+  const scale = Math.max(0.8, pageWidth / 1100);
+  const cardWidth = 172 * scale;
+  const lineHeight = 22 * scale;
+  const padding = 12 * scale;
+  const cardHeight =
+    padding * 2 + lineHeight * (summary.steps.length + 2);
+  const x = Math.min(
+    pageWidth - cardWidth - padding,
+    Math.max(padding, annotation.x * pageWidth),
+  );
+  const y = Math.min(
+    pageHeight - cardHeight - padding,
+    Math.max(padding, annotation.y * pageHeight),
+  );
+
+  context.save();
+  context.fillStyle = "rgba(244, 255, 252, 0.48)";
+  context.strokeStyle = "rgba(7, 116, 108, 0.55)";
+  context.lineWidth = Math.max(1, 1.5 * scale);
+  drawRoundedRect(context, x, y, cardWidth, cardHeight, 10 * scale);
+
+  const left = x + padding;
+  const right = x + cardWidth - padding;
+  let textY = y + padding + lineHeight * 0.72;
+  context.fillStyle = "#17304d";
+  context.font = `700 ${14 * scale}px Arial, sans-serif`;
+  context.textAlign = "left";
+  context.fillText(summary.questionNo, left, textY);
+
+  context.font = `600 ${12 * scale}px Arial, sans-serif`;
+  for (const step of summary.steps) {
+    textY += lineHeight;
+    context.fillStyle = "#075f59";
+    context.textAlign = "left";
+    context.fillText(`S${step.stepNo}`, left, textY);
+    context.textAlign = "right";
+    context.fillText(
+      `${formatMark(step.awarded)}/${formatMark(step.max)}`,
+      right,
+      textY,
+    );
+  }
+
+  textY += lineHeight;
+  context.strokeStyle = "rgba(7, 116, 108, 0.28)";
+  context.beginPath();
+  context.moveTo(left, textY - lineHeight * 0.72);
+  context.lineTo(right, textY - lineHeight * 0.72);
+  context.stroke();
+  context.fillStyle = "#17304d";
+  context.font = `700 ${13 * scale}px Arial, sans-serif`;
+  context.textAlign = "left";
+  context.fillText("Total", left, textY);
+  context.textAlign = "right";
+  context.fillText(
+    `${formatMark(summary.awarded)}/${formatMark(summary.max)}`,
+    right,
+    textY,
+  );
+  context.restore();
+}
+
 function AiNoteCard({
   note,
   onDelete,
@@ -372,6 +566,11 @@ export function EvaluationWorkspace({
   });
   const [notice, setNotice] = useState("");
   const [markingWarning, setMarkingWarning] = useState("");
+  const [actionMenuOpen, setActionMenuOpen] = useState(false);
+  const [resetPaperOpen, setResetPaperOpen] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+  const [resettingPaper, setResettingPaper] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
   const [loading, setLoading] = useState(true);
   const aiSelectionRef = useRef<AiSelection | null>(null);
   const rightPanelRef = useRef<HTMLElement>(null);
@@ -971,14 +1170,115 @@ export function EvaluationWorkspace({
 
   const submitEvaluation = async () => {
     setNotice("");
+    setActionMenuOpen(false);
+    setSubmitting(true);
     try {
       await api(`/evaluations/${evaluationId}/submit`, { method: "POST" });
-      setNotice("Evaluation submitted successfully.");
-      await loadOverview();
+      onBack();
     } catch (error) {
       setNotice(
         error instanceof Error ? error.message : "Unable to submit evaluation",
       );
+      setSubmitting(false);
+    }
+  };
+
+  const downloadMarkedAnswerSheet = async () => {
+    setActionMenuOpen(false);
+    setDownloading(true);
+    setNotice("");
+    try {
+      const loadedPages = await Promise.all(
+        pages.map(async (page) => ({
+          page,
+          image: await loadExportImage(`${API_BASE}${page.image_url}`),
+        })),
+      );
+      if (loadedPages.length === 0) {
+        throw new Error("No answer-sheet pages are available to download.");
+      }
+      const pdfPages = loadedPages.map(({ page, image }) => {
+        const canvas = document.createElement("canvas");
+        canvas.width = image.naturalWidth;
+        canvas.height = image.naturalHeight;
+        const context = canvas.getContext("2d");
+        if (!context) {
+          throw new Error("Unable to prepare the answer-sheet download.");
+        }
+        context.fillStyle = "#ffffff";
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        context.drawImage(
+          image,
+          0,
+          0,
+          canvas.width,
+          canvas.height,
+        );
+        annotations
+          .filter(
+            (annotation) =>
+              annotation.page_id === page.page_id &&
+              annotation.step_id === null,
+          )
+          .forEach((annotation) =>
+            drawExportTotal(
+              context,
+              annotation,
+              canvas.width,
+              canvas.height,
+            ),
+          );
+        return {
+          bytes: canvasToJpegBytes(canvas),
+          width: canvas.width,
+          height: canvas.height,
+        };
+      });
+      const blob = createImagePdf(pdfPages);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      const student = (evaluation?.student_name || evaluation?.student_id || "student")
+        .replace(/[^a-z0-9]+/gi, "-")
+        .replace(/^-|-$/g, "")
+        .toLowerCase();
+      link.href = url;
+      link.download = `${student || "student"}-marked-answer-sheet.pdf`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      setNotice("Marked answer sheet downloaded.");
+    } catch (error) {
+      setNotice(
+        error instanceof Error
+          ? error.message
+          : "Unable to download the marked answer sheet",
+      );
+    } finally {
+      setDownloading(false);
+    }
+  };
+
+  const resetQuestionPaper = async () => {
+    setResettingPaper(true);
+    setNotice("");
+    try {
+      await api(`/evaluations/${evaluationId}/marks`, { method: "DELETE" });
+      setResetPaperOpen(false);
+      setAnnotations([]);
+      setExpandedMarkId(null);
+      setExpandedTotalIds(new Set());
+      await loadOverview();
+      if (question) await refreshQuestionState(question.question_id);
+      setNotice("All marks and marking labels were reset.");
+    } catch (error) {
+      setNotice(
+        error instanceof Error
+          ? error.message
+          : "Unable to reset the question paper",
+      );
+    } finally {
+      setResettingPaper(false);
     }
   };
 
@@ -998,6 +1298,7 @@ export function EvaluationWorkspace({
       onClick={() => {
         setMenu(null);
         setExpandedMarkId(null);
+        setActionMenuOpen(false);
       }}
       style={workspaceStyle}
     >
@@ -1040,13 +1341,63 @@ export function EvaluationWorkspace({
         >
           {progress.status}
         </span>
-        <button
-          className="button-primary submit-button"
-          onClick={submitEvaluation}
-          type="button"
+        <div
+          className="evaluation-actions"
+          onClick={(event) => event.stopPropagation()}
         >
-          Submit evaluation
-        </button>
+          <button
+            className="button-primary submit-button"
+            disabled={submitting}
+            onClick={() => void submitEvaluation()}
+            type="button"
+          >
+            {submitting ? "Submitting…" : "Submit evaluation"}
+          </button>
+          <button
+            aria-expanded={actionMenuOpen}
+            aria-haspopup="menu"
+            aria-label="Open evaluation actions"
+            className="button-primary evaluation-actions-toggle"
+            onClick={() => setActionMenuOpen((open) => !open)}
+            type="button"
+          >
+            ▾
+          </button>
+          {actionMenuOpen && (
+            <div className="evaluation-actions-menu" role="menu">
+              <button
+                disabled={submitting}
+                onClick={() => void submitEvaluation()}
+                role="menuitem"
+                type="button"
+              >
+                <strong>Submit evaluation</strong>
+                <span>Complete and return to dashboard</span>
+              </button>
+              <button
+                disabled={downloading}
+                onClick={() => void downloadMarkedAnswerSheet()}
+                role="menuitem"
+                type="button"
+              >
+                <strong>{downloading ? "Preparing download…" : "Download"}</strong>
+                <span>Answer sheet with question totals</span>
+              </button>
+              <button
+                className="danger"
+                onClick={() => {
+                  setActionMenuOpen(false);
+                  setResetPaperOpen(true);
+                }}
+                role="menuitem"
+                type="button"
+              >
+                <strong>Reset question paper</strong>
+                <span>Delete marks for every question</span>
+              </button>
+            </div>
+          )}
+        </div>
       </header>
 
       <aside className="left-panel side-panel">
@@ -1520,6 +1871,40 @@ export function EvaluationWorkspace({
       )}
 
       {notice && <div className="toast">{notice}</div>}
+      {resetPaperOpen && (
+        <div
+          aria-labelledby="reset-paper-title"
+          aria-modal="true"
+          className="confirmation-backdrop"
+          role="dialog"
+        >
+          <div className="confirmation-dialog">
+            <strong id="reset-paper-title">Reset the entire question paper?</strong>
+            <p>
+              This will permanently delete all awarded marks and marking labels
+              for every question. The uploaded answer sheet will remain.
+            </p>
+            <div>
+              <button
+                className="button-ghost"
+                disabled={resettingPaper}
+                onClick={() => setResetPaperOpen(false)}
+                type="button"
+              >
+                Cancel
+              </button>
+              <button
+                className="button-danger"
+                disabled={resettingPaper}
+                onClick={() => void resetQuestionPaper()}
+                type="button"
+              >
+                {resettingPaper ? "Resetting…" : "Reset question paper"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {markingWarning && (
         <div className="marking-warning-popup" role="alert">
           <div>

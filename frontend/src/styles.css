@@ -803,6 +803,123 @@ td > small {
 
 .submit-button {
   white-space: nowrap;
+  border-radius: 8px 0 0 8px;
+}
+
+.evaluation-actions {
+  position: relative;
+  display: flex;
+}
+
+.evaluation-actions-toggle {
+  min-width: 34px;
+  border-left: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 0 8px 8px 0;
+  padding-right: 9px;
+  padding-left: 9px;
+}
+
+.evaluation-actions-menu {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 8px);
+  right: 0;
+  display: grid;
+  width: 250px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.97);
+  box-shadow: 0 14px 36px rgba(23, 44, 77, 0.2);
+  backdrop-filter: blur(12px);
+}
+
+.evaluation-actions-menu button {
+  display: grid;
+  gap: 3px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: transparent;
+  padding: 12px 14px;
+  color: var(--navy);
+  text-align: left;
+}
+
+.evaluation-actions-menu button:last-child {
+  border-bottom: 0;
+}
+
+.evaluation-actions-menu button:hover:not(:disabled) {
+  background: #f1f7f6;
+}
+
+.evaluation-actions-menu button.danger {
+  color: #a6323b;
+}
+
+.evaluation-actions-menu button.danger:hover {
+  background: #fff1f2;
+}
+
+.evaluation-actions-menu span {
+  color: var(--muted);
+  font-size: 0.68rem;
+}
+
+.confirmation-backdrop {
+  position: fixed;
+  z-index: 50;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(16, 31, 50, 0.38);
+  padding: 20px;
+  backdrop-filter: blur(3px);
+}
+
+.confirmation-dialog {
+  width: min(410px, 100%);
+  border: 1px solid rgba(164, 47, 57, 0.2);
+  border-radius: 14px;
+  background: white;
+  box-shadow: 0 22px 60px rgba(23, 44, 77, 0.28);
+  padding: 22px;
+}
+
+.confirmation-dialog > strong {
+  color: var(--navy);
+  font-size: 1.02rem;
+}
+
+.confirmation-dialog p {
+  margin: 10px 0 20px;
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.55;
+}
+
+.confirmation-dialog > div {
+  display: flex;
+  justify-content: flex-end;
+  gap: 9px;
+}
+
+.button-danger {
+  border: 1px solid #a6323b;
+  border-radius: 8px;
+  background: #a6323b;
+  padding: 9px 13px;
+  color: white;
+  font-weight: 700;
+}
+
+.button-danger:hover:not(:disabled) {
+  background: #8d2730;
+}
+
+.button-danger:disabled {
+  cursor: wait;
+  opacity: 0.62;
 }
 
 .side-panel {
