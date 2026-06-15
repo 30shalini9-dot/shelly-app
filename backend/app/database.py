@@ -951,8 +951,8 @@ def accept_ai_vision_marks(
                 page_id,
                 f"TAI|{question['question_no']}|{step_text}|"
                 f"{awarded_total:g}/{question['max_marks']:g}",
-                min(0.82, x + width + 0.01),
-                min(0.88, y + height + 0.01),
+                min(0.82, max(0.08, x + width / 2)),
+                min(0.88, max(0.06, y + height / 2)),
                 0.18,
                 0.12,
                 timestamp,

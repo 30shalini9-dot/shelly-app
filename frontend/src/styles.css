@@ -1042,13 +1042,14 @@ td > small {
 }
 
 .question-legend {
-  display: grid;
+  display: flex;
   flex: 0 0 auto;
-  gap: 7px;
-  border-top: 1px solid var(--line);
-  padding: 12px 16px;
+  flex-wrap: wrap;
+  gap: 5px 9px;
+  border-bottom: 1px solid var(--line);
+  padding: 7px 12px;
   color: var(--muted);
-  font-size: 0.64rem;
+  font-size: 0.56rem;
 }
 
 .question-legend span {
@@ -1064,6 +1065,56 @@ td > small {
   border-radius: 3px;
   background: #e9edf0;
   content: "";
+}
+
+.drawing-tools {
+  display: grid;
+  flex: 0 0 auto;
+  grid-template-columns: auto repeat(4, minmax(0, 1fr));
+  align-items: center;
+  gap: 5px;
+  margin: 8px;
+  border: 1px solid rgba(13, 143, 133, 0.2);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.8);
+  padding: 7px;
+  box-shadow: 0 7px 18px rgba(23, 44, 77, 0.1);
+}
+
+.drawing-tools > span {
+  color: var(--teal-dark);
+  font-size: 0.58rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.drawing-tools button {
+  min-width: 0;
+  border: 1px solid #d6dee3;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.82);
+  padding: 6px 3px;
+  color: #506073;
+  font-size: 0.56rem;
+  font-weight: 700;
+}
+
+.drawing-tools button.active {
+  border-color: var(--teal);
+  background: var(--teal-soft);
+  color: var(--teal-dark);
+}
+
+.drawing-tools label {
+  display: block;
+}
+
+.drawing-tools input[type="color"] {
+  width: 100%;
+  height: 26px;
+  border: 0;
+  border-radius: 6px;
+  padding: 2px;
 }
 
 .question-legend .legend-current::before {
@@ -1203,6 +1254,27 @@ td > small {
   cursor: crosshair;
 }
 
+.answer-canvas.tool-pen,
+.answer-canvas.tool-pen .answer-page {
+  cursor:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cpath d='M4 20l4.5-1 10-10-3.5-3.5-10 10L4 20z' fill='%23ffffff' stroke='%23172c4d' stroke-width='1.5'/%3E%3Cpath d='M13.8 6.7l3.5 3.5' stroke='%23172c4d' stroke-width='1.5'/%3E%3C/svg%3E")
+      3 21,
+    crosshair;
+}
+
+.answer-canvas.tool-eraser,
+.answer-canvas.tool-eraser .answer-page {
+  cursor:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cpath d='M5 15l8-9 6 5-7 8H8l-3-4z' fill='%23ffffff' stroke='%23172c4d' stroke-width='1.5'/%3E%3Cpath d='M9 19h10' stroke='%23172c4d' stroke-width='1.5'/%3E%3C/svg%3E")
+      5 18,
+    cell;
+}
+
+.answer-canvas.tool-text,
+.answer-canvas.tool-text .answer-page {
+  cursor: text;
+}
+
 .answer-pages {
   display: flex;
   min-width: 440px;
@@ -1247,6 +1319,16 @@ td > small {
   border-radius: 3px;
   box-shadow: 0 14px 36px rgba(34, 45, 56, 0.28);
   user-select: none;
+}
+
+.drawing-layer {
+  position: absolute;
+  z-index: 4;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
 }
 
 .step-mark-annotation {
@@ -1348,6 +1430,10 @@ td > small {
   padding: 10px;
   text-align: left;
   transform: translate(-8px, -8px);
+}
+
+.question-total-annotation.ai-generated {
+  transform: translate(-50%, -50%);
 }
 
 .question-total-heading {
@@ -1509,8 +1595,8 @@ td > small {
 .ai-result-response {
   position: absolute;
   z-index: 20;
-  right: 12px;
   width: clamp(220px, 32vw, 360px);
+  transform: translate(-50%, -50%);
 }
 
 .ai-result-actions {

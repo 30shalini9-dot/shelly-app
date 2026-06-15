@@ -187,6 +187,14 @@ class ApiTestCase(unittest.TestCase):
         self.assertTrue(
             accept_ai_response.json()["annotation"]["text"].startswith("TAI|")
         )
+        self.assertAlmostEqual(
+            accept_ai_response.json()["annotation"]["x"],
+            0.3,
+        )
+        self.assertAlmostEqual(
+            accept_ai_response.json()["annotation"]["y"],
+            0.3,
+        )
         self.assertEqual(
             self.client.get(
                 f"/evaluations/{evaluation_id}/questions/"
