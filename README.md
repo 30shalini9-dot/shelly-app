@@ -178,10 +178,9 @@ DELETE /evaluations/{evaluation_id}/questions/{question_id}/marks
 GET   /evaluations/{evaluation_id}/annotations
 POST  /evaluations/{evaluation_id}/annotations
 PATCH /evaluations/{evaluation_id}/annotations/{annotation_id}
-GET   /evaluations/{evaluation_id}/ai-vision-notes
-POST  /evaluations/{evaluation_id}/ai-vision-notes
-DELETE /evaluations/{evaluation_id}/ai-vision-notes/{note_id}
 POST  /evaluations/{evaluation_id}/ai-vision
+POST  /evaluations/{evaluation_id}/ai-vision/accept
+POST  /evaluations/{evaluation_id}/ai-vision/reject
 GET   /evaluations/{evaluation_id}/progress
 GET   /evaluations/{evaluation_id}/marks-summary
 POST  /evaluations/{evaluation_id}/submit
@@ -200,18 +199,26 @@ The backend rejects negative marks and marks above the step maximum.
 An evaluation can only be submitted after every step has a mark.
 Resetting a question removes its step marks and answer-sheet mark labels.
 
-## AI Vision reference notes
+## AI Vision marking
 
 In the evaluation workspace, right-click an answer page and choose
 **AI Vision selection**, then drag a rectangle around the answer area. The
-frontend sends the cropped image, current question text, page, and rectangle
-coordinates as multipart form data:
+frontend sends the cropped image, current question, page, and rectangle
+coordinates as multipart form data. The backend loads the question text,
+reference solution, and ordered marking steps from SQLite before calling the
+local Ollama model:
+
+```bash
+ollama pull qwen3.5:4b
+```
+
+Install backend dependencies before starting the API so the Python Ollama
+client is available.
 
 ```bash
 curl -X POST http://localhost:8000/evaluations/EV_ID/ai-vision \
   -F 'question_id=QUESTION_ID' \
   -F 'page_id=PAGE_ID' \
-  -F 'question_text=Define photosynthesis.' \
   -F 'x=0.2' \
   -F 'y=0.3' \
   -F 'width=0.4' \
@@ -219,24 +226,28 @@ curl -X POST http://localhost:8000/evaluations/EV_ID/ai-vision \
   -F 'crop=@/absolute/path/answer-selection.png'
 ```
 
-The current endpoint is a local dummy implementation. It waits five seconds
-and returns transient reference text without calling an external AI service.
-The selection rectangle is removed when the response arrives. Use the response
-card's **Save** action to store the note in SQLite and minimize it to a circular
-marker on the answer page, or **Delete** to discard it.
-
-Save the returned analysis and coordinates:
+The response contains one normalized mark per configured step. Extra model
+values are ignored, missing or invalid values become zero, and every value is
+clamped to the step maximum. The evaluator can accept or reject the proposal.
+Rejecting it writes nothing. Accepting it atomically stores every step mark and
+creates the question-total annotation:
 
 ```text
-POST /evaluations/{evaluation_id}/ai-vision-notes
+POST /evaluations/{evaluation_id}/ai-vision/accept
 ```
 
-Saved notes can be reloaded or removed with:
+Accepted AI totals keep an `AI` badge on the answer sheet after reload.
+
+Every request is retained for debugging under:
 
 ```text
-GET /evaluations/{evaluation_id}/ai-vision-notes
-DELETE /evaluations/{evaluation_id}/ai-vision-notes/{note_id}
+backend/data/ai_vision/{run_id}/
 ```
+
+The folder contains the exact `answer-selection` image sent to Ollama,
+`context.txt`, request metadata, the raw model response, and normalized marks.
+Model rationale is retained internally for a future review feature but is
+intentionally hidden from the current UI.
 
 ## Tests and builds
 

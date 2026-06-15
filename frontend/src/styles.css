@@ -1042,13 +1042,14 @@ td > small {
 }
 
 .question-legend {
-  display: grid;
+  display: flex;
   flex: 0 0 auto;
-  gap: 7px;
-  border-top: 1px solid var(--line);
-  padding: 12px 16px;
+  flex-wrap: wrap;
+  gap: 5px 9px;
+  border-bottom: 1px solid var(--line);
+  padding: 7px 12px;
   color: var(--muted);
-  font-size: 0.64rem;
+  font-size: 0.56rem;
 }
 
 .question-legend span {
@@ -1064,6 +1065,56 @@ td > small {
   border-radius: 3px;
   background: #e9edf0;
   content: "";
+}
+
+.drawing-tools {
+  display: grid;
+  flex: 0 0 auto;
+  grid-template-columns: auto repeat(4, minmax(0, 1fr));
+  align-items: center;
+  gap: 5px;
+  margin: 8px;
+  border: 1px solid rgba(13, 143, 133, 0.2);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.8);
+  padding: 7px;
+  box-shadow: 0 7px 18px rgba(23, 44, 77, 0.1);
+}
+
+.drawing-tools > span {
+  color: var(--teal-dark);
+  font-size: 0.58rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.drawing-tools button {
+  min-width: 0;
+  border: 1px solid #d6dee3;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.82);
+  padding: 6px 3px;
+  color: #506073;
+  font-size: 0.56rem;
+  font-weight: 700;
+}
+
+.drawing-tools button.active {
+  border-color: var(--teal);
+  background: var(--teal-soft);
+  color: var(--teal-dark);
+}
+
+.drawing-tools label {
+  display: block;
+}
+
+.drawing-tools input[type="color"] {
+  width: 100%;
+  height: 26px;
+  border: 0;
+  border-radius: 6px;
+  padding: 2px;
 }
 
 .question-legend .legend-current::before {
@@ -1203,6 +1254,27 @@ td > small {
   cursor: crosshair;
 }
 
+.answer-canvas.tool-pen,
+.answer-canvas.tool-pen .answer-page {
+  cursor:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cpath d='M4 20l4.5-1 10-10-3.5-3.5-10 10L4 20z' fill='%23ffffff' stroke='%23172c4d' stroke-width='1.5'/%3E%3Cpath d='M13.8 6.7l3.5 3.5' stroke='%23172c4d' stroke-width='1.5'/%3E%3C/svg%3E")
+      3 21,
+    crosshair;
+}
+
+.answer-canvas.tool-eraser,
+.answer-canvas.tool-eraser .answer-page {
+  cursor:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cpath d='M5 15l8-9 6 5-7 8H8l-3-4z' fill='%23ffffff' stroke='%23172c4d' stroke-width='1.5'/%3E%3Cpath d='M9 19h10' stroke='%23172c4d' stroke-width='1.5'/%3E%3C/svg%3E")
+      5 18,
+    cell;
+}
+
+.answer-canvas.tool-text,
+.answer-canvas.tool-text .answer-page {
+  cursor: text;
+}
+
 .answer-pages {
   display: flex;
   min-width: 440px;
@@ -1247,6 +1319,16 @@ td > small {
   border-radius: 3px;
   box-shadow: 0 14px 36px rgba(34, 45, 56, 0.28);
   user-select: none;
+}
+
+.drawing-layer {
+  position: absolute;
+  z-index: 4;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
 }
 
 .step-mark-annotation {
@@ -1350,10 +1432,40 @@ td > small {
   transform: translate(-8px, -8px);
 }
 
+.question-total-annotation.ai-generated {
+  transform: translate(-50%, -50%);
+}
+
 .question-total-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   color: var(--navy);
   font-size: 0.72rem;
   font-weight: 800;
+}
+
+.question-total-ai,
+.ai-result-badge {
+  display: inline-grid;
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border: 1px solid rgba(7, 116, 108, 0.48);
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.86);
+  color: #075f59;
+  font-size: 0.52rem;
+  font-weight: 900;
+  line-height: 1;
+}
+
+.question-total-annotation.collapsed .question-total-ai {
+  width: 20px;
+  height: 20px;
+  margin-left: -6px;
 }
 
 .question-total-steps {
@@ -1367,6 +1479,49 @@ td > small {
   justify-content: space-between;
   gap: 12px;
   font-size: 0.62rem;
+}
+
+.ai-result-card {
+  width: min(280px, calc(100vw - 48px));
+  border: 1px solid rgba(7, 116, 108, 0.3);
+  border-radius: 12px;
+  background: rgba(250, 255, 253, 0.96);
+  box-shadow: 0 14px 34px rgba(18, 59, 57, 0.22);
+  padding: 12px;
+  color: var(--navy);
+  backdrop-filter: blur(12px);
+}
+
+.ai-result-heading,
+.ai-result-total,
+.ai-result-steps > span {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.ai-result-heading {
+  justify-content: flex-start;
+  margin-bottom: 10px;
+}
+
+.ai-result-steps {
+  display: grid;
+  gap: 5px;
+}
+
+.ai-result-steps small {
+  overflow: hidden;
+  color: #3d5268;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-result-total {
+  margin-top: 9px;
+  border-top: 1px solid rgba(7, 116, 108, 0.2);
+  padding-top: 8px;
 }
 
 .question-total-result {
@@ -1409,8 +1564,7 @@ td > small {
   pointer-events: none;
 }
 
-.ai-selection span,
-.ai-note-icon {
+.ai-selection span {
   display: grid;
   width: 34px;
   height: 34px;
@@ -1438,74 +1592,21 @@ td > small {
   }
 }
 
-.ai-note-icon {
-  border: 0;
-}
-
-.ai-note-marker {
-  position: absolute;
-  z-index: 8;
-  right: -17px;
-  transform: translateY(-50%);
-}
-
-.ai-note-marker .ai-note-icon {
-  width: 30px;
-  height: 30px;
-  font-size: 0.58rem;
-}
-
-.ai-note-marker.expanded {
-  z-index: 20;
-}
-
-.ai-note-card {
-  z-index: 2;
-  width: clamp(220px, 32vw, 360px);
-  border: 1px solid #d6c5eb;
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.98);
-  box-shadow: 0 16px 38px rgba(39, 27, 55, 0.22);
-  padding: 13px;
-  color: #3e3250;
-}
-
-.ai-note-marker .ai-note-card {
-  position: absolute;
-  top: 0;
-  right: calc(100% + 10px);
-}
-
-.ai-note-response {
+.ai-result-response {
   position: absolute;
   z-index: 20;
-  right: 12px;
   width: clamp(220px, 32vw, 360px);
+  transform: translate(-50%, -50%);
 }
 
-.ai-note-response .ai-note-card {
-  width: 100%;
-}
-
-.ai-note-actions {
+.ai-result-actions {
   display: flex;
   align-items: center;
   gap: 12px;
   margin-top: 12px;
 }
 
-.ai-note-card strong {
-  color: #654292;
-  font-size: 0.76rem;
-}
-
-.ai-note-card p {
-  margin: 9px 0 0;
-  font-size: 0.72rem;
-  line-height: 1.55;
-}
-
-.ai-note-actions button {
+.ai-result-actions button {
   min-width: 76px;
   border: 1px solid #d6c5eb;
   border-radius: 7px;
@@ -1514,12 +1615,12 @@ td > small {
   font-weight: 800;
 }
 
-.ai-note-actions .ai-note-save {
+.ai-result-actions .ai-result-accept {
   background: #7048a2;
   color: white;
 }
 
-.ai-note-actions .ai-note-delete {
+.ai-result-actions .ai-result-reject {
   background: white;
   color: var(--danger);
 }

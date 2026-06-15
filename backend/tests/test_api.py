@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -38,10 +39,18 @@ class ApiTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         root = Path(self.temp_dir.name)
+        self.root = root
         database.DATABASE_PATH = root / "test.db"
         database.UPLOAD_DIR = root / "uploads"
         self.client_context = TestClient(
-            create_app(seed_data=False, ai_delay_seconds=0)
+            create_app(
+                seed_data=False,
+                ai_evaluator=lambda _prompt, _image_path: {
+                    "marks": [0.75, 99],
+                    "reasoning": "The submitted answer satisfies the criterion.",
+                },
+                ai_vision_run_dir=root / "ai_vision",
+            )
         )
         self.client = self.client_context.__enter__()
 
@@ -119,7 +128,6 @@ class ApiTestCase(unittest.TestCase):
             data={
                 "question_id": question["question_id"],
                 "page_id": pages[0]["page_id"],
-                "question_text": "What is 1 + 1?",
                 "x": "0.1",
                 "y": "0.2",
                 "width": "0.4",
@@ -133,50 +141,66 @@ class ApiTestCase(unittest.TestCase):
             ],
         )
         self.assertEqual(ai_response.status_code, 201)
-        self.assertIn("Dummy AI Vision review", ai_response.json()["analysis"])
+        self.assertEqual(ai_response.json()["marks"], [0.75])
+        self.assertEqual(ai_response.json()["awarded_marks"], 0.75)
+        run_id = ai_response.json()["run_id"]
+        run_dir = self.root / "ai_vision" / run_id
         self.assertEqual(
-            self.client.get(
-                f"/evaluations/{evaluation_id}/ai-vision-notes"
-            ).json(),
-            [],
+            (run_dir / "answer-selection.png").read_bytes(),
+            b"dummy-image-bytes",
+        )
+        context = (run_dir / "context.txt").read_text("utf-8")
+        self.assertIn("What is 1 + 1?", context)
+        self.assertIn("Answer: The answer is 2. (max 1)", context)
+        self.assertEqual(
+            json.loads((run_dir / "result.json").read_text("utf-8"))["marks"],
+            [0.75],
         )
 
-        save_ai_response = self.client.post(
-            f"/evaluations/{evaluation_id}/ai-vision-notes",
+        accept_ai_response = self.client.post(
+            f"/evaluations/{evaluation_id}/ai-vision/accept",
             json={
-                key: value
-                for key, value in ai_response.json().items()
-                if key
-                in {
-                    "question_id",
-                    "page_id",
-                    "analysis",
-                    "x",
-                    "y",
-                    "width",
-                    "height",
-                }
+                "run_id": run_id,
+                "question_id": question["question_id"],
+                "page_id": pages[0]["page_id"],
+                "marks": ai_response.json()["marks"],
+                "x": 0.1,
+                "y": 0.2,
+                "width": 0.4,
+                "height": 0.2,
             },
         )
-        self.assertEqual(save_ai_response.status_code, 201)
-        saved_note_id = save_ai_response.json()["note_id"]
+        self.assertEqual(accept_ai_response.status_code, 200)
         self.assertEqual(
-            len(
-                self.client.get(
-                    f"/evaluations/{evaluation_id}/ai-vision-notes"
-                ).json()
-            ),
-            1,
+            accept_ai_response.json()["question"]["awarded_marks"],
+            0.75,
         )
-        delete_ai_response = self.client.delete(
-            f"/evaluations/{evaluation_id}/ai-vision-notes/{saved_note_id}"
+        self.assertEqual(
+            json.loads((run_dir / "metadata.json").read_text("utf-8"))[
+                "decision"
+            ],
+            "accepted",
         )
-        self.assertEqual(delete_ai_response.status_code, 204)
+        hidden_notes = database.list_ai_vision_notes(evaluation_id)
+        self.assertEqual(len(hidden_notes or []), 1)
+        self.assertIn("satisfies the criterion", hidden_notes[0]["analysis"])
+        self.assertTrue(
+            accept_ai_response.json()["annotation"]["text"].startswith("TAI|")
+        )
+        self.assertAlmostEqual(
+            accept_ai_response.json()["annotation"]["x"],
+            0.3,
+        )
+        self.assertAlmostEqual(
+            accept_ai_response.json()["annotation"]["y"],
+            0.3,
+        )
         self.assertEqual(
             self.client.get(
-                f"/evaluations/{evaluation_id}/ai-vision-notes"
-            ).json(),
-            [],
+                f"/evaluations/{evaluation_id}/questions/"
+                f"{question['question_id']}"
+            ).json()["steps"][0]["awarded_marks"],
+            0.75,
         )
 
         reset_response = self.client.delete(

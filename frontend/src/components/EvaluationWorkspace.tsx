@@ -10,7 +10,8 @@ import {
 } from "react";
 import { API_BASE, api } from "../api";
 import type {
-  AiVisionNote,
+  AiVisionAcceptResponse,
+  AiVisionResult,
   Annotation,
   Evaluation,
   Page,
@@ -49,12 +50,33 @@ interface MarkAnnotationProps {
   onExpand: () => void;
 }
 
-interface AiNoteCardProps {
-  note: AiVisionNote;
-  onDelete: () => void;
-  onSave: () => void;
-  saveLabel?: string;
+interface AiResultCardProps {
+  result: AiVisionResult;
+  accepting: boolean;
+  onAccept: () => void;
+  onReject: () => void;
 }
+
+type DrawingTool = "pen" | "eraser" | "text";
+
+interface DrawingStroke {
+  id: string;
+  kind: "stroke";
+  color: string;
+  width: number;
+  points: Array<{ x: number; y: number }>;
+}
+
+interface DrawingText {
+  id: string;
+  kind: "text";
+  color: string;
+  x: number;
+  y: number;
+  text: string;
+}
+
+type DrawingItem = DrawingStroke | DrawingText;
 
 interface QuestionTotalSummary {
   questionNo: string;
@@ -68,6 +90,7 @@ interface QuestionTotalSummary {
 }
 
 const TOTAL_ANNOTATION_PREFIX = "T|";
+const AI_TOTAL_ANNOTATION_PREFIX = "TAI|";
 const LEGACY_TOTAL_ANNOTATION_PREFIX = "TOTAL:";
 
 function formatMark(value: number) {
@@ -89,7 +112,10 @@ function serializeQuestionTotal(question: Question) {
 }
 
 function parseQuestionTotal(text: string): QuestionTotalSummary | null {
-  if (text.startsWith(TOTAL_ANNOTATION_PREFIX)) {
+  if (
+    text.startsWith(TOTAL_ANNOTATION_PREFIX) ||
+    text.startsWith(AI_TOTAL_ANNOTATION_PREFIX)
+  ) {
     const [, questionNo, stepText, totalText] = text.split("|");
     const total = totalText?.split("/").map(Number);
     const steps = stepText
@@ -263,6 +289,206 @@ function drawRoundedRect(
   context.stroke();
 }
 
+function createAnswerSheetCover(
+  evaluation: Evaluation,
+  progress: Progress,
+  detailedQuestions: Question[],
+) {
+  const canvas = document.createElement("canvas");
+  canvas.width = 1240;
+  canvas.height = 1754;
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("Unable to prepare the answer-sheet cover.");
+
+  const centerX = canvas.width / 2;
+  const awardedMarks = progress.total_marks;
+  const maximumMarks = progress.maximum_marks;
+  const percentage =
+    maximumMarks > 0 ? (awardedMarks / maximumMarks) * 100 : 0;
+  const rows = detailedQuestions.flatMap((item) =>
+    (item.steps || []).map((step) => ({
+      questionNo: item.question_no,
+      stepNo: step.step_no,
+      maximum: step.max_marks,
+      awarded: step.awarded_marks,
+    })),
+  );
+
+  context.fillStyle = "#f4f8f8";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.fillStyle = "#102b45";
+  context.fillRect(0, 0, canvas.width, 270);
+  context.fillStyle = "#0d8f85";
+  context.fillRect(0, 260, canvas.width, 10);
+
+  context.beginPath();
+  context.arc(1080, 50, 230, 0, Math.PI * 2);
+  context.fillStyle = "rgba(41, 184, 169, 0.16)";
+  context.fill();
+  context.beginPath();
+  context.arc(1100, 70, 150, 0, Math.PI * 2);
+  context.strokeStyle = "rgba(255, 255, 255, 0.16)";
+  context.lineWidth = 3;
+  context.stroke();
+
+  context.textAlign = "center";
+  context.fillStyle = "#72ddd3";
+  context.font = "700 24px Arial, sans-serif";
+  context.fillText("EVALUATED ANSWER SHEET", centerX, 70);
+  context.fillStyle = "#ffffff";
+  context.font = "800 58px Arial, sans-serif";
+  context.fillText(
+    evaluation.student_name || evaluation.student_id,
+    centerX,
+    145,
+  );
+  context.fillStyle = "rgba(255, 255, 255, 0.74)";
+  context.font = "500 24px Arial, sans-serif";
+  context.fillText(
+    `${evaluation.subject_name}  |  Class ${evaluation.class_code}`,
+    centerX,
+    200,
+  );
+
+  const detailsY = 325;
+  context.fillStyle = "#ffffff";
+  context.strokeStyle = "#d6e3e4";
+  context.lineWidth = 2;
+  drawRoundedRect(context, 100, detailsY, 1040, 132, 24);
+  const details = [
+    ["Student ID", evaluation.student_id],
+    ["Subject", evaluation.subject_name],
+    ["Class", evaluation.class_code],
+  ];
+  details.forEach(([label, value], index) => {
+    const x = 130 + index * 347;
+    if (index > 0) {
+      context.beginPath();
+      context.moveTo(x - 30, detailsY + 28);
+      context.lineTo(x - 30, detailsY + 104);
+      context.strokeStyle = "#dfe9e9";
+      context.stroke();
+    }
+    context.textAlign = "left";
+    context.fillStyle = "#70808d";
+    context.font = "700 18px Arial, sans-serif";
+    context.fillText(label.toUpperCase(), x, detailsY + 45);
+    context.fillStyle = "#172c4d";
+    context.font = "700 25px Arial, sans-serif";
+    context.fillText(value, x, detailsY + 84);
+  });
+
+  const cardY = 500;
+  const cards = [
+    ["MARKS SCORED", formatMark(awardedMarks), "#0d8f85"],
+    ["TOTAL MARKS", formatMark(maximumMarks), "#172c4d"],
+    ["ACHIEVED", `${formatMark(percentage)}%`, "#d28a28"],
+  ];
+  cards.forEach(([label, value, color], index) => {
+    const x = 100 + index * 360;
+    context.fillStyle = "#ffffff";
+    context.strokeStyle = "#d6e3e4";
+    context.lineWidth = 2;
+    drawRoundedRect(context, x, cardY, 320, 154, 24);
+    context.textAlign = "center";
+    context.fillStyle = String(color);
+    context.font = "800 48px Arial, sans-serif";
+    context.fillText(String(value), x + 160, cardY + 72);
+    context.fillStyle = "#70808d";
+    context.font = "700 17px Arial, sans-serif";
+    context.fillText(String(label), x + 160, cardY + 116);
+  });
+
+  context.textAlign = "center";
+  context.fillStyle = "#172c4d";
+  context.font = "800 30px Arial, sans-serif";
+  context.fillText("Question and Step Marking Summary", centerX, 720);
+  context.fillStyle = "#70808d";
+  context.font = "500 18px Arial, sans-serif";
+  context.fillText(
+    "Detailed marks awarded for each evaluated step",
+    centerX,
+    754,
+  );
+
+  const tableX = 150;
+  const tableY = 800;
+  const tableWidth = 940;
+  const headerHeight = 64;
+  const availableHeight = 780;
+  const rowHeight = Math.min(
+    58,
+    Math.max(25, (availableHeight - headerHeight) / Math.max(1, rows.length)),
+  );
+  const tableHeight = headerHeight + rows.length * rowHeight;
+  context.fillStyle = "#ffffff";
+  context.strokeStyle = "#cfdddf";
+  context.lineWidth = 2;
+  drawRoundedRect(context, tableX, tableY, tableWidth, tableHeight, 18);
+
+  context.save();
+  context.beginPath();
+  context.roundRect(tableX, tableY, tableWidth, headerHeight, 18);
+  context.clip();
+  context.fillStyle = "#0b756f";
+  context.fillRect(tableX, tableY, tableWidth, headerHeight);
+  context.restore();
+
+  const columns = [
+    { label: "QUESTION NO.", x: tableX + 145 },
+    { label: "STEP NO.", x: tableX + 380 },
+    { label: "MAX MARKS", x: tableX + 615 },
+    { label: "MARKS SCORED", x: tableX + 820 },
+  ];
+  context.fillStyle = "#ffffff";
+  context.font = "800 18px Arial, sans-serif";
+  context.textAlign = "center";
+  context.textBaseline = "middle";
+  columns.forEach((column) =>
+    context.fillText(column.label, column.x, tableY + headerHeight / 2),
+  );
+
+  const rowFontSize = Math.min(22, Math.max(13, rowHeight * 0.4));
+  rows.forEach((row, index) => {
+    const y = tableY + headerHeight + index * rowHeight;
+    context.fillStyle = index % 2 === 0 ? "#ffffff" : "#f1f7f7";
+    context.fillRect(tableX + 1, y, tableWidth - 2, rowHeight);
+    context.strokeStyle = "#e2ebec";
+    context.lineWidth = 1;
+    context.beginPath();
+    context.moveTo(tableX, y + rowHeight);
+    context.lineTo(tableX + tableWidth, y + rowHeight);
+    context.stroke();
+    context.font = `700 ${rowFontSize}px Arial, sans-serif`;
+    context.fillStyle = "#243b53";
+    context.fillText(row.questionNo, columns[0].x, y + rowHeight / 2);
+    context.fillText(`S${row.stepNo}`, columns[1].x, y + rowHeight / 2);
+    context.fillText(
+      formatMark(row.maximum),
+      columns[2].x,
+      y + rowHeight / 2,
+    );
+    context.fillStyle = "#08746c";
+    context.fillText(
+      row.awarded === null ? "-" : formatMark(row.awarded),
+      columns[3].x,
+      y + rowHeight / 2,
+    );
+  });
+
+  context.textBaseline = "alphabetic";
+  context.fillStyle = "#70808d";
+  context.font = "500 16px Arial, sans-serif";
+  context.fillText(
+    `${evaluation.subject_code}  |  ${evaluation.question_paper_code}`,
+    centerX,
+    1688,
+  );
+  context.fillStyle = "#0d8f85";
+  context.fillRect(centerX - 45, 1715, 90, 5);
+  return canvas;
+}
+
 function drawExportTotal(
   context: CanvasRenderingContext2D,
   annotation: Annotation,
@@ -277,13 +503,18 @@ function drawExportTotal(
   const padding = 12 * scale;
   const cardHeight =
     padding * 2 + lineHeight * (summary.steps.length + 2);
+  const isAiGenerated = annotation.text.startsWith(
+    AI_TOTAL_ANNOTATION_PREFIX,
+  );
+  const rawX = annotation.x * pageWidth - (isAiGenerated ? cardWidth / 2 : 0);
+  const rawY = annotation.y * pageHeight - (isAiGenerated ? cardHeight / 2 : 0);
   const x = Math.min(
     pageWidth - cardWidth - padding,
-    Math.max(padding, annotation.x * pageWidth),
+    Math.max(padding, rawX),
   );
   const y = Math.min(
     pageHeight - cardHeight - padding,
-    Math.max(padding, annotation.y * pageHeight),
+    Math.max(padding, rawY),
   );
 
   context.save();
@@ -330,25 +561,135 @@ function drawExportTotal(
     right,
     textY,
   );
+  if (isAiGenerated) {
+    context.fillStyle = "#ffffff";
+    context.strokeStyle = "#075f59";
+    context.beginPath();
+    context.arc(right - 7 * scale, y + 12 * scale, 9 * scale, 0, Math.PI * 2);
+    context.fill();
+    context.stroke();
+    context.fillStyle = "#075f59";
+    context.font = `800 ${7 * scale}px Arial, sans-serif`;
+    context.textAlign = "center";
+    context.fillText("AI", right - 7 * scale, y + 14.5 * scale);
+  }
   context.restore();
 }
 
-function AiNoteCard({
-  note,
-  onDelete,
-  onSave,
-  saveLabel = "Save",
-}: AiNoteCardProps) {
+function drawExportStep(
+  context: CanvasRenderingContext2D,
+  annotation: Annotation,
+  pageWidth: number,
+  pageHeight: number,
+) {
+  const stepLabel = annotation.text.match(/(?:^|\s)S(\d+)(?:\s|·|$)/)?.[1];
+  if (!stepLabel) return;
+  const scale = Math.max(0.8, pageWidth / 1100);
+  const fontSize = 11 * scale;
+  const paddingX = 10 * scale;
+  const height = 30 * scale;
+  const x = annotation.x * pageWidth;
+  const y = annotation.y * pageHeight;
+  context.save();
+  context.font = `800 ${fontSize}px Arial, sans-serif`;
+  const width = context.measureText(annotation.text).width + paddingX * 2;
+  const left = Math.min(
+    pageWidth - width - paddingX,
+    Math.max(paddingX, x - height / 2),
+  );
+  const top = Math.min(
+    pageHeight - height - paddingX,
+    Math.max(paddingX, y - height / 2),
+  );
+  context.globalAlpha = 0.7;
+  context.fillStyle = "rgba(255, 255, 255, 0.72)";
+  context.strokeStyle = "rgba(158, 45, 55, 0.78)";
+  context.lineWidth = Math.max(1.5, 1.8 * scale);
+  drawRoundedRect(context, left, top, width, height, height / 2);
+  context.fillStyle = "#9e2d37";
+  context.textAlign = "center";
+  context.textBaseline = "middle";
+  context.fillText(annotation.text, left + width / 2, top + height / 2);
+  context.restore();
+}
+
+function drawExportDrawings(
+  context: CanvasRenderingContext2D,
+  items: DrawingItem[],
+  pageWidth: number,
+  pageHeight: number,
+) {
+  for (const item of items) {
+    context.save();
+    context.fillStyle = item.color;
+    context.strokeStyle = item.color;
+    if (item.kind === "text") {
+      context.font = `600 ${Math.max(14, pageWidth * 0.018)}px Arial, sans-serif`;
+      context.textBaseline = "top";
+      context.fillText(item.text, item.x * pageWidth, item.y * pageHeight);
+    } else if (item.points.length > 1) {
+      context.lineCap = "round";
+      context.lineJoin = "round";
+      context.lineWidth = Math.max(1.5, item.width * pageWidth);
+      context.beginPath();
+      item.points.forEach((point, index) => {
+        const x = point.x * pageWidth;
+        const y = point.y * pageHeight;
+        if (index === 0) context.moveTo(x, y);
+        else context.lineTo(x, y);
+      });
+      context.stroke();
+    }
+    context.restore();
+  }
+}
+
+function AiResultCard({
+  result,
+  accepting,
+  onAccept,
+  onReject,
+}: AiResultCardProps) {
   return (
-    <div className="ai-note-card">
-      <strong>AI Vision reference</strong>
-      <p>{note.analysis}</p>
-      <div className="ai-note-actions">
-        <button className="ai-note-save" onClick={onSave} type="button">
-          {saveLabel}
+    <div className="ai-result-card">
+      <div className="ai-result-heading">
+        <span className="ai-result-badge">AI</span>
+        <strong>{result.question_no} suggested marks</strong>
+      </div>
+      <div className="ai-result-steps">
+        {result.steps.map((step) => (
+          <span key={step.step_id}>
+            <small>
+              S{step.step_no} · {step.title}
+            </small>
+            <strong>
+              {formatMark(step.awarded_marks)}/{formatMark(step.max_marks)}
+            </strong>
+          </span>
+        ))}
+      </div>
+      <div className="ai-result-total">
+        <span>Total</span>
+        <strong>
+          {formatMark(result.awarded_marks)}/{formatMark(result.max_marks)}
+        </strong>
+      </div>
+      <div className="ai-result-actions">
+        <button
+          className="ai-result-accept"
+          disabled={accepting}
+          onClick={onAccept}
+          type="button"
+        >
+          {accepting ? "Accepting…" : "Accept marks"}
         </button>
-        <button className="ai-note-delete" onClick={onDelete} type="button">
-          Delete
+        <button
+          className="ai-result-reject"
+          disabled={accepting}
+          onClick={onReject}
+          type="button"
+        >
+          Reject
         </button>
       </div>
     </div>
@@ -400,6 +741,9 @@ function QuestionTotalAnnotation({
   onMove,
 }: QuestionTotalAnnotationProps) {
   const summary = parseQuestionTotal(annotation.text);
+  const isAiGenerated = annotation.text.startsWith(
+    AI_TOTAL_ANNOTATION_PREFIX,
+  );
   const dragRef = useRef<{
     pointerId: number;
     startClientX: number;
@@ -418,7 +762,7 @@ function QuestionTotalAnnotation({
       aria-expanded={expanded}
       className={`question-total-annotation ${
         expanded ? "expanded" : "collapsed"
-      }`}
+      } ${isAiGenerated ? "ai-generated" : ""}`}
       onClick={(event) => {
         event.stopPropagation();
         if (suppressClickRef.current) {
@@ -464,21 +808,33 @@ function QuestionTotalAnnotation({
         const deltaY = event.clientY - drag.startClientY;
         if (!drag.moved && Math.hypot(deltaX, deltaY) < 4) return;
         drag.moved = true;
+        const halfWidth = isAiGenerated
+          ? event.currentTarget.offsetWidth / page.clientWidth / 2
+          : 0;
+        const halfHeight = isAiGenerated
+          ? event.currentTarget.offsetHeight / page.clientHeight / 2
+          : 0;
+        const minX = halfWidth;
+        const minY = halfHeight;
         const maxX = Math.max(
-          0,
-          1 - event.currentTarget.offsetWidth / page.clientWidth,
+          minX,
+          1 -
+            event.currentTarget.offsetWidth / page.clientWidth +
+            halfWidth,
         );
         const maxY = Math.max(
-          0,
-          1 - event.currentTarget.offsetHeight / page.clientHeight,
+          minY,
+          1 -
+            event.currentTarget.offsetHeight / page.clientHeight +
+            halfHeight,
         );
         drag.x = Math.min(
           maxX,
-          Math.max(0, drag.startX + deltaX / page.clientWidth),
+          Math.max(minX, drag.startX + deltaX / page.clientWidth),
         );
         drag.y = Math.min(
           maxY,
-          Math.max(0, drag.startY + deltaY / page.clientHeight),
+          Math.max(minY, drag.startY + deltaY / page.clientHeight),
         );
         event.currentTarget.style.left = `${drag.x * 100}%`;
         event.currentTarget.style.top = `${drag.y * 100}%`;
@@ -503,7 +859,10 @@ function QuestionTotalAnnotation({
     >
       {expanded ? (
         <>
-          <span className="question-total-heading">{summary.questionNo}</span>
+          <span className="question-total-heading">
+            {summary.questionNo}
+            {isAiGenerated && <span className="question-total-ai">AI</span>}
+          </span>
           <span className="question-total-steps">
             {summary.steps.map((step) => (
               <span key={step.stepNo}>
@@ -523,6 +882,7 @@ function QuestionTotalAnnotation({
         </>
       ) : (
         <>
+          {isAiGenerated && <span className="question-total-ai">AI</span>}
           <strong>{summary.questionNo}:</strong>
           <span>
             {formatMark(summary.awarded)}/{formatMark(summary.max)}
@@ -543,9 +903,9 @@ export function EvaluationWorkspace({
   const [question, setQuestion] = useState<Question | null>(null);
   const [progress, setProgress] = useState<Progress | null>(null);
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
-  const [aiNotes, setAiNotes] = useState<AiVisionNote[]>([]);
-  const [pendingAiNote, setPendingAiNote] = useState<AiVisionNote | null>(null);
-  const [expandedNotes, setExpandedNotes] = useState<Set<string>>(new Set());
+  const [pendingAiResult, setPendingAiResult] =
+    useState<AiVisionResult | null>(null);
+  const [acceptingAiResult, setAcceptingAiResult] = useState(false);
   const [zoom, setZoom] = useState(0.82);
   const [rotation, setRotation] = useState(0);
   const [leftOpen, setLeftOpen] = useState(true);
@@ -558,6 +918,22 @@ export function EvaluationWorkspace({
     new Set(),
   );
   const [toolMode, setToolMode] = useState<"ai-select" | null>(null);
+  const [drawingTool, setDrawingTool] = useState<DrawingTool | null>(null);
+  const [drawingColor, setDrawingColor] = useState("#b4232f");
+  const [drawingItems, setDrawingItems] = useState<
+    Record<string, DrawingItem[]>
+  >(() => {
+    try {
+      const saved = window.localStorage.getItem(
+        `sheldon-drawings:${evaluationId}`,
+      );
+      return saved
+        ? (JSON.parse(saved) as Record<string, DrawingItem[]>)
+        : {};
+    } catch {
+      return {};
+    }
+  });
   const [aiSelection, setAiSelectionState] = useState<AiSelection | null>(null);
   const [questionCursor, setQuestionCursor] = useState({
     x: 0,
@@ -576,6 +952,20 @@ export function EvaluationWorkspace({
   const rightPanelRef = useRef<HTMLElement>(null);
   const totalTimersRef = useRef(new Map<string, number>());
   const markingWarningTimerRef = useRef<number | null>(null);
+  const annotationMovePromisesRef = useRef(
+    new Map<string, Promise<Annotation>>(),
+  );
+  const activeStrokeRef = useRef<{
+    pageId: string;
+    item: DrawingStroke;
+  } | null>(null);
+  const activeTextDragRef = useRef<{
+    pageId: string;
+    itemId: string;
+    offsetX: number;
+    offsetY: number;
+  } | null>(null);
+  const drawingStorageKey = `sheldon-drawings:${evaluationId}`;
 
   const setAiSelection = (selection: AiSelection | null) => {
     aiSelectionRef.current = selection;
@@ -589,21 +979,18 @@ export function EvaluationWorkspace({
       questionData,
       progressData,
       annotationData,
-      aiNoteData,
     ] = await Promise.all([
       api<Evaluation>(`/evaluations/${evaluationId}`),
       api<Page[]>(`/evaluations/${evaluationId}/pages`),
       api<Question[]>(`/evaluations/${evaluationId}/questions`),
       api<Progress>(`/evaluations/${evaluationId}/progress`),
       api<Annotation[]>(`/evaluations/${evaluationId}/annotations`),
-      api<AiVisionNote[]>(`/evaluations/${evaluationId}/ai-vision-notes`),
     ]);
     setEvaluation(evaluationData);
     setPages(pageData);
     setQuestions(questionData);
     setProgress(progressData);
     setAnnotations(annotationData);
-    setAiNotes(aiNoteData);
     return questionData;
   }, [evaluationId]);
 
@@ -628,6 +1015,17 @@ export function EvaluationWorkspace({
     },
     [evaluationId],
   );
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        drawingStorageKey,
+        JSON.stringify(drawingItems),
+      );
+    } catch {
+      setNotice("Unable to save drawing changes in this browser.");
+    }
+  }, [drawingItems, drawingStorageKey]);
 
   useEffect(() => {
     loadOverview()
@@ -900,11 +1298,21 @@ export function EvaluationWorkspace({
           : annotation,
       ),
     );
-    try {
-      await api(`/evaluations/${evaluationId}/annotations/${annotationId}`, {
+    const request = api<Annotation>(
+      `/evaluations/${evaluationId}/annotations/${annotationId}`,
+      {
         method: "PATCH",
         body: JSON.stringify({ x, y }),
-      });
+      },
+    );
+    annotationMovePromisesRef.current.set(annotationId, request);
+    try {
+      const saved = await request;
+      setAnnotations((current) =>
+        current.map((annotation) =>
+          annotation.annotation_id === annotationId ? saved : annotation,
+        ),
+      );
     } catch (error) {
       const annotationData = await api<Annotation[]>(
         `/evaluations/${evaluationId}/annotations`,
@@ -915,6 +1323,10 @@ export function EvaluationWorkspace({
           ? error.message
           : "Unable to move the question total",
       );
+    } finally {
+      if (annotationMovePromisesRef.current.get(annotationId) === request) {
+        annotationMovePromisesRef.current.delete(annotationId);
+      }
     }
   };
 
@@ -969,6 +1381,137 @@ export function EvaluationWorkspace({
       x: Math.min(1, Math.max(0, (event.clientX - bounds.left) / bounds.width)),
       y: Math.min(1, Math.max(0, (event.clientY - bounds.top) / bounds.height)),
     };
+  };
+
+  const eraseAtPoint = (pageId: string, point: { x: number; y: number }) => {
+    const threshold = 0.025;
+    setDrawingItems((current) => ({
+      ...current,
+      [pageId]: (current[pageId] || []).filter((item) => {
+        if (item.kind === "text") {
+          return Math.hypot(item.x - point.x, item.y - point.y) > threshold * 2;
+        }
+        return !item.points.some(
+          (candidate) =>
+            Math.hypot(candidate.x - point.x, candidate.y - point.y) <=
+            threshold,
+        );
+      }),
+    }));
+  };
+
+  const beginDrawing = (
+    event: PointerEvent<HTMLDivElement>,
+    pageId: string,
+  ) => {
+    if (!drawingTool) return false;
+    event.preventDefault();
+    event.stopPropagation();
+    const point = normalizedPoint(event);
+    if (drawingTool === "eraser") {
+      eraseAtPoint(pageId, point);
+      return true;
+    }
+    if (drawingTool === "text") {
+      const existingText = [...(drawingItems[pageId] || [])]
+        .reverse()
+        .find(
+          (item): item is DrawingText =>
+            item.kind === "text" &&
+            Math.abs(item.x - point.x) <= 0.12 &&
+            Math.abs(item.y - point.y) <= 0.035,
+        );
+      if (existingText) {
+        event.currentTarget.setPointerCapture(event.pointerId);
+        activeTextDragRef.current = {
+          pageId,
+          itemId: existingText.id,
+          offsetX: point.x - existingText.x,
+          offsetY: point.y - existingText.y,
+        };
+        return true;
+      }
+      const text = window.prompt("Text to place on the answer sheet");
+      if (text?.trim()) {
+        const item: DrawingText = {
+          id: crypto.randomUUID(),
+          kind: "text",
+          color: drawingColor,
+          x: point.x,
+          y: point.y,
+          text: text.trim(),
+        };
+        setDrawingItems((current) => ({
+          ...current,
+          [pageId]: [...(current[pageId] || []), item],
+        }));
+      }
+      return true;
+    }
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const item: DrawingStroke = {
+      id: crypto.randomUUID(),
+      kind: "stroke",
+      color: drawingColor,
+      width: 0.004,
+      points: [point],
+    };
+    activeStrokeRef.current = { pageId, item };
+    setDrawingItems((current) => ({
+      ...current,
+      [pageId]: [...(current[pageId] || []), item],
+    }));
+    return true;
+  };
+
+  const moveDrawing = (
+    event: PointerEvent<HTMLDivElement>,
+    pageId: string,
+  ) => {
+    const textDrag = activeTextDragRef.current;
+    if (textDrag?.pageId === pageId) {
+      const point = normalizedPoint(event);
+      setDrawingItems((current) => ({
+        ...current,
+        [pageId]: (current[pageId] || []).map((item) =>
+          item.id === textDrag.itemId && item.kind === "text"
+            ? {
+                ...item,
+                x: Math.min(0.98, Math.max(0, point.x - textDrag.offsetX)),
+                y: Math.min(0.98, Math.max(0, point.y - textDrag.offsetY)),
+              }
+            : item,
+        ),
+      }));
+      return true;
+    }
+    if (drawingTool === "eraser" && event.buttons === 1) {
+      eraseAtPoint(pageId, normalizedPoint(event));
+      return true;
+    }
+    const active = activeStrokeRef.current;
+    if (!active || active.pageId !== pageId) return false;
+    const point = normalizedPoint(event);
+    active.item.points.push(point);
+    setDrawingItems((current) => ({
+      ...current,
+      [pageId]: (current[pageId] || []).map((item) =>
+        item.id === active.item.id
+          ? { ...active.item, points: [...active.item.points] }
+          : item,
+      ),
+    }));
+    return true;
+  };
+
+  const finishDrawing = (event: PointerEvent<HTMLDivElement>) => {
+    if (!activeStrokeRef.current && !activeTextDragRef.current) return false;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    activeStrokeRef.current = null;
+    activeTextDragRef.current = null;
+    return true;
   };
 
   const beginAiSelection = (
@@ -1058,20 +1601,19 @@ export function EvaluationWorkspace({
       const formData = new FormData();
       formData.append("question_id", question.question_id);
       formData.append("page_id", selection.pageId);
-      formData.append("question_text", question.question_text);
       formData.append("x", String(selection.x));
       formData.append("y", String(selection.y));
       formData.append("width", String(selection.width));
       formData.append("height", String(selection.height));
       formData.append("crop", crop, "answer-selection.png");
-      const note = await api<AiVisionNote>(
+      const result = await api<AiVisionResult>(
         `/evaluations/${evaluationId}/ai-vision`,
         { method: "POST", body: formData },
       );
       setAiSelection(null);
       setToolMode(null);
-      setPendingAiNote(note);
-      setNotice("AI Vision analysis is ready. Save or delete the note.");
+      setPendingAiResult(result);
+      setNotice("AI Vision marks are ready. Accept or reject the suggestion.");
     } catch (error) {
       setAiSelection(null);
       setToolMode(null);
@@ -1103,67 +1645,58 @@ export function EvaluationWorkspace({
     void analyzeAiSelection(event.currentTarget, selection);
   };
 
-  const toggleAiNote = (noteId: string) => {
-    setExpandedNotes((current) => {
-      const next = new Set(current);
-      if (next.has(noteId)) next.delete(noteId);
-      else next.add(noteId);
-      return next;
-    });
-  };
-
-  const savePendingAiNote = async () => {
-    if (!pendingAiNote) return;
+  const acceptPendingAiResult = async () => {
+    if (!pendingAiResult) return;
+    setAcceptingAiResult(true);
     try {
-      const savedNote = await api<AiVisionNote>(
-        `/evaluations/${evaluationId}/ai-vision-notes`,
+      const result = await api<AiVisionAcceptResponse>(
+        `/evaluations/${evaluationId}/ai-vision/accept`,
         {
           method: "POST",
           body: JSON.stringify({
-            question_id: pendingAiNote.question_id,
-            page_id: pendingAiNote.page_id,
-            analysis: pendingAiNote.analysis,
-            x: pendingAiNote.x,
-            y: pendingAiNote.y,
-            width: pendingAiNote.width,
-            height: pendingAiNote.height,
+            run_id: pendingAiResult.run_id,
+            question_id: pendingAiResult.question_id,
+            page_id: pendingAiResult.page_id,
+            marks: pendingAiResult.marks,
+            x: pendingAiResult.x,
+            y: pendingAiResult.y,
+            width: pendingAiResult.width,
+            height: pendingAiResult.height,
           }),
         },
       );
-      setAiNotes((current) => [...current, savedNote]);
-      setPendingAiNote(null);
-      setNotice("AI Vision note saved.");
+      setPendingAiResult(null);
+      await refreshQuestionState(result.question.question_id);
+      expandQuestionTotal(result.annotation.annotation_id);
+      setNotice(
+        `${result.question.question_no} AI marks accepted: ${formatMark(
+          result.question.awarded_marks,
+        )}/${formatMark(result.question.max_marks)}.`,
+      );
+      await moveToNextQuestion(result.question.question_id);
     } catch (error) {
       setNotice(
-        error instanceof Error ? error.message : "Unable to save AI Vision note",
+        error instanceof Error ? error.message : "Unable to accept AI marks",
       );
+    } finally {
+      setAcceptingAiResult(false);
     }
   };
 
-  const deleteAiNote = async (note: AiVisionNote, saved: boolean) => {
+  const rejectPendingAiResult = async () => {
+    if (!pendingAiResult) return;
     try {
-      if (saved) {
-        await api<void>(
-          `/evaluations/${evaluationId}/ai-vision-notes/${note.note_id}`,
-          { method: "DELETE" },
-        );
-        setAiNotes((current) =>
-          current.filter((item) => item.note_id !== note.note_id),
-        );
-        setExpandedNotes((current) => {
-          const next = new Set(current);
-          next.delete(note.note_id);
-          return next;
-        });
-      } else {
-        setPendingAiNote(null);
-      }
-      setNotice("AI Vision note deleted.");
+      await api(`/evaluations/${evaluationId}/ai-vision/reject`, {
+        method: "POST",
+        body: JSON.stringify({ run_id: pendingAiResult.run_id }),
+      });
+      setPendingAiResult(null);
+      setNotice("AI Vision marks rejected. No marks were changed.");
     } catch (error) {
       setNotice(
         error instanceof Error
           ? error.message
-          : "Unable to delete AI Vision note",
+          : "Unable to reject AI Vision marks",
       );
     }
   };
@@ -1184,10 +1717,23 @@ export function EvaluationWorkspace({
   };
 
   const downloadMarkedAnswerSheet = async () => {
+    if (!evaluation || !progress) return;
     setActionMenuOpen(false);
     setDownloading(true);
     setNotice("");
     try {
+      await Promise.all(annotationMovePromisesRef.current.values());
+      const latestAnnotations = await api<Annotation[]>(
+        `/evaluations/${evaluationId}/annotations`,
+      );
+      const detailedQuestions = await Promise.all(
+        questions.map((item) =>
+          api<Question>(
+            `/evaluations/${evaluationId}/questions/${item.question_id}`,
+          ),
+        ),
+      );
+      setAnnotations(latestAnnotations);
       const loadedPages = await Promise.all(
         pages.map(async (page) => ({
           page,
@@ -1197,7 +1743,12 @@ export function EvaluationWorkspace({
       if (loadedPages.length === 0) {
         throw new Error("No answer-sheet pages are available to download.");
       }
-      const pdfPages = loadedPages.map(({ page, image }) => {
+      const cover = createAnswerSheetCover(
+        evaluation,
+        progress,
+        detailedQuestions,
+      );
+      const answerPages = loadedPages.map(({ page, image }) => {
         const canvas = document.createElement("canvas");
         canvas.width = image.naturalWidth;
         canvas.height = image.naturalHeight;
@@ -1214,7 +1765,16 @@ export function EvaluationWorkspace({
           canvas.width,
           canvas.height,
         );
-        annotations
+        latestAnnotations
+          .filter(
+            (annotation) =>
+              annotation.page_id === page.page_id &&
+              annotation.step_id !== null,
+          )
+          .forEach((annotation) =>
+            drawExportStep(context, annotation, canvas.width, canvas.height),
+          );
+        latestAnnotations
           .filter(
             (annotation) =>
               annotation.page_id === page.page_id &&
@@ -1228,12 +1788,26 @@ export function EvaluationWorkspace({
               canvas.height,
             ),
           );
+        drawExportDrawings(
+          context,
+          drawingItems[page.page_id] || [],
+          canvas.width,
+          canvas.height,
+        );
         return {
           bytes: canvasToJpegBytes(canvas),
           width: canvas.width,
           height: canvas.height,
         };
       });
+      const pdfPages = [
+        {
+          bytes: canvasToJpegBytes(cover),
+          width: cover.width,
+          height: cover.height,
+        },
+        ...answerPages,
+      ];
       const blob = createImagePdf(pdfPages);
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
@@ -1417,6 +1991,11 @@ export function EvaluationWorkspace({
             ‹
           </button>
         </div>
+        <div className="question-legend">
+          <span className="legend-viewed">Viewed</span>
+          <span className="legend-current">Current / partial</span>
+          <span className="legend-completed">Completed</span>
+        </div>
         <div className="compact-question-grid">
           {questions.map((item) => {
             const stateClass =
@@ -1443,10 +2022,48 @@ export function EvaluationWorkspace({
             );
           })}
         </div>
-        <div className="question-legend">
-          <span className="legend-viewed">Viewed</span>
-          <span className="legend-current">Current / partial</span>
-          <span className="legend-completed">Completed</span>
+        <div className="drawing-tools" onClick={(event) => event.stopPropagation()}>
+          <span>Draw</span>
+          <button
+            className={drawingTool === "pen" ? "active" : ""}
+            onClick={() =>
+              setDrawingTool((current) => (current === "pen" ? null : "pen"))
+            }
+            title="Pen"
+            type="button"
+          >
+            Pen
+          </button>
+          <label title="Drawing color">
+            <input
+              aria-label="Drawing color"
+              onChange={(event) => setDrawingColor(event.target.value)}
+              type="color"
+              value={drawingColor}
+            />
+          </label>
+          <button
+            className={drawingTool === "eraser" ? "active" : ""}
+            onClick={() =>
+              setDrawingTool((current) =>
+                current === "eraser" ? null : "eraser",
+              )
+            }
+            title="Eraser"
+            type="button"
+          >
+            Erase
+          </button>
+          <button
+            className={drawingTool === "text" ? "active" : ""}
+            onClick={() =>
+              setDrawingTool((current) => (current === "text" ? null : "text"))
+            }
+            title="Text"
+            type="button"
+          >
+            Text
+          </button>
         </div>
         <section className="left-progress-summary">
           <p className="panel-label">Evaluation progress</p>
@@ -1509,7 +2126,9 @@ export function EvaluationWorkspace({
           )}
         </div>
         <div
-          className={`answer-canvas ${toolMode ? "tool-active" : ""}`}
+          className={`answer-canvas ${
+            toolMode || drawingTool ? "tool-active" : ""
+          } ${drawingTool ? `tool-${drawingTool}` : ""}`}
           onMouseEnter={() =>
             setQuestionCursor((cursor) => ({ ...cursor, visible: true }))
           }
@@ -1529,13 +2148,12 @@ export function EvaluationWorkspace({
               const pageAnnotations = annotations.filter(
                 (annotation) => annotation.page_id === page.page_id,
               );
-              const pageAiNotes = aiNotes.filter(
-                (note) => note.page_id === page.page_id,
-              );
               const selection =
                 aiSelection?.pageId === page.page_id ? aiSelection : null;
-              const pendingNote =
-                pendingAiNote?.page_id === page.page_id ? pendingAiNote : null;
+              const pendingResult =
+                pendingAiResult?.page_id === page.page_id
+                  ? pendingAiResult
+                  : null;
               return (
                 <div className="answer-page-frame" key={page.page_id}>
                   <span className="page-number-label">
@@ -1545,14 +2163,19 @@ export function EvaluationWorkspace({
                     className="answer-page"
                     onContextMenu={(event) => openMarkMenu(event, page.page_id)}
                     onPointerDown={(event) =>
+                      beginDrawing(event, page.page_id) ||
                       beginAiSelection(event, page.page_id)
                     }
-                    onPointerMove={(event) =>
-                      moveAiSelection(event, page.page_id)
-                    }
-                    onPointerUp={(event) =>
-                      finishAiSelection(event, page.page_id)
-                    }
+                    onPointerMove={(event) => {
+                      if (!moveDrawing(event, page.page_id)) {
+                        moveAiSelection(event, page.page_id);
+                      }
+                    }}
+                    onPointerUp={(event) => {
+                      if (!finishDrawing(event)) {
+                        finishAiSelection(event, page.page_id);
+                      }
+                    }}
                     style={{
                       transform: `rotate(${rotation}deg)`,
                       width: `${zoom * 100}%`,
@@ -1564,6 +2187,40 @@ export function EvaluationWorkspace({
                       draggable={false}
                       src={`${API_BASE}${page.image_url}`}
                     />
+                    <svg
+                      aria-hidden="true"
+                      className="drawing-layer"
+                      preserveAspectRatio="none"
+                      viewBox="0 0 1 1"
+                    >
+                      {(drawingItems[page.page_id] || []).map((item) =>
+                        item.kind === "stroke" ? (
+                          <polyline
+                            fill="none"
+                            key={item.id}
+                            points={item.points
+                              .map((point) => `${point.x},${point.y}`)
+                              .join(" ")}
+                            stroke={item.color}
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            strokeWidth={item.width}
+                          />
+                        ) : (
+                          <text
+                            dominantBaseline="hanging"
+                            fill={item.color}
+                            fontSize="0.022"
+                            fontWeight="600"
+                            key={item.id}
+                            x={item.x}
+                            y={item.y}
+                          >
+                            {item.text}
+                          </text>
+                        ),
+                      )}
+                    </svg>
                     {pageAnnotations.map((annotation) =>
                       annotation.step_id === null ? (
                         <QuestionTotalAnnotation
@@ -1600,51 +2257,33 @@ export function EvaluationWorkspace({
                         />
                       ),
                     )}
-                    {pageAiNotes.map((note) => (
+                    {pendingResult && (
                       <div
-                        className={`ai-note-marker ${
-                          expandedNotes.has(note.note_id) ? "expanded" : ""
-                        }`}
-                        key={note.note_id}
-                        onContextMenu={(event) => event.stopPropagation()}
-                        onClick={(event) => event.stopPropagation()}
-                        style={{
-                          top: `${note.y * 100}%`,
-                        }}
-                      >
-                        <button
-                          className="ai-note-icon"
-                          onClick={() => toggleAiNote(note.note_id)}
-                          title="Open AI Vision note"
-                          type="button"
-                        >
-                          AI
-                        </button>
-                        {expandedNotes.has(note.note_id) && (
-                          <AiNoteCard
-                            note={note}
-                            onDelete={() => void deleteAiNote(note, true)}
-                            onSave={() => toggleAiNote(note.note_id)}
-                          />
-                        )}
-                      </div>
-                    ))}
-                    {pendingNote && (
-                      <div
-                        className="ai-note-response"
+                        className="ai-result-response"
                         onClick={(event) => event.stopPropagation()}
                         onContextMenu={(event) => event.stopPropagation()}
                         style={{
-                          top: `${Math.min(
+                          left: `${Math.min(
                             0.82,
-                            pendingNote.y + pendingNote.height,
+                            Math.max(
+                              0.18,
+                              pendingResult.x + pendingResult.width / 2,
+                            ),
+                          ) * 100}%`,
+                          top: `${Math.min(
+                            0.8,
+                            Math.max(
+                              0.2,
+                              pendingResult.y + pendingResult.height / 2,
+                            ),
                           ) * 100}%`,
                         }}
                       >
-                        <AiNoteCard
-                          note={pendingNote}
-                          onDelete={() => void deleteAiNote(pendingNote, false)}
-                          onSave={() => void savePendingAiNote()}
+                        <AiResultCard
+                          accepting={acceptingAiResult}
+                          onAccept={() => void acceptPendingAiResult()}
+                          onReject={() => void rejectPendingAiResult()}
+                          result={pendingResult}
                         />
                       </div>
                     )}
@@ -1826,8 +2465,8 @@ export function EvaluationWorkspace({
               className="context-ai"
               onClick={() => {
                 setMenu(null);
-                if (pendingAiNote) {
-                  setNotice("Save or delete the current AI Vision note first.");
+                if (pendingAiResult) {
+                  setNotice("Accept or reject the current AI marks first.");
                   return;
                 }
                 setToolMode("ai-select");

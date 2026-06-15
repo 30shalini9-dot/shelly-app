@@ -861,6 +861,140 @@ def create_annotation(
     )
 
 
+def accept_ai_vision_marks(
+    evaluation_id: str,
+    *,
+    question_id: str,
+    page_id: str,
+    marks: list[float],
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+    reasoning: str = "",
+) -> dict[str, Any]:
+    with connection() as conn:
+        question = conn.execute(
+            """
+            SELECT q.id, q.question_no, q.max_marks
+            FROM evaluations e
+            JOIN student_submissions s ON s.id = e.submission_id
+            JOIN questions q
+              ON q.question_paper_id = s.question_paper_id
+             AND q.id = ?
+            JOIN submission_pages sp
+              ON sp.submission_id = s.id
+             AND sp.id = ?
+            WHERE e.id = ?
+            """,
+            (question_id, page_id, evaluation_id),
+        ).fetchone()
+        if not question:
+            raise LookupError("Question or answer-sheet page was not found")
+
+        steps = conn.execute(
+            """
+            SELECT id, step_no, max_marks
+            FROM question_steps
+            WHERE question_id = ?
+            ORDER BY step_no
+            """,
+            (question_id,),
+        ).fetchall()
+        if len(marks) != len(steps):
+            raise ValueError("AI marks must contain one value for every step")
+        for mark, step in zip(marks, steps):
+            if mark < 0 or mark > step["max_marks"]:
+                raise ValueError(
+                    f"Marks for step {step['step_no']} must be between 0 and "
+                    f"{step['max_marks']:g}"
+                )
+
+        timestamp = now_iso()
+        for mark, step in zip(marks, steps):
+            conn.execute(
+                """
+                INSERT INTO evaluation_step_marks (
+                    id, evaluation_id, step_id, awarded_marks, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(evaluation_id, step_id)
+                DO UPDATE SET awarded_marks = excluded.awarded_marks,
+                              updated_at = excluded.updated_at
+                """,
+                (new_id("mark"), evaluation_id, step["id"], mark, timestamp),
+            )
+
+        conn.execute(
+            """
+            DELETE FROM answer_annotations
+            WHERE evaluation_id = ? AND question_id = ?
+            """,
+            (evaluation_id, question_id),
+        )
+        step_text = ",".join(
+            f"{mark:g}/{step['max_marks']:g}"
+            for mark, step in zip(marks, steps)
+        )
+        awarded_total = sum(marks)
+        annotation_id = new_id("ann")
+        conn.execute(
+            """
+            INSERT INTO answer_annotations (
+                id, evaluation_id, question_id, step_id, page_id, text,
+                x, y, width, height, created_at, updated_at
+            ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                annotation_id,
+                evaluation_id,
+                question_id,
+                page_id,
+                f"TAI|{question['question_no']}|{step_text}|"
+                f"{awarded_total:g}/{question['max_marks']:g}",
+                min(0.82, max(0.08, x + width / 2)),
+                min(0.88, max(0.06, y + height / 2)),
+                0.18,
+                0.12,
+                timestamp,
+                timestamp,
+            ),
+        )
+        # Hidden for now: retain model rationale so a future review UI can show
+        # why the AI awarded each mark without reviving the old dummy note flow.
+        if reasoning:
+            conn.execute(
+                """
+                INSERT INTO ai_vision_notes (
+                    id, evaluation_id, question_id, page_id, analysis,
+                    x, y, width, height, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    new_id("ai"),
+                    evaluation_id,
+                    question_id,
+                    page_id,
+                    reasoning,
+                    x,
+                    y,
+                    width,
+                    height,
+                    timestamp,
+                ),
+            )
+        _touch_evaluation(conn, evaluation_id)
+
+    annotation = next(
+        item
+        for item in list_annotations(evaluation_id) or []
+        if item["annotation_id"] == annotation_id
+    )
+    return {
+        "question": get_question(evaluation_id, question_id),
+        "annotation": annotation,
+    }
+
+
 def update_annotation(
     evaluation_id: str, annotation_id: str, data: dict[str, Any]
 ) -> dict[str, Any]:
@@ -907,121 +1041,6 @@ def list_ai_vision_notes(evaluation_id: str) -> list[dict[str, Any]] | None:
             (evaluation_id,),
         ).fetchall()
     return [dict(row) for row in rows]
-
-
-def preview_ai_vision_note(
-    evaluation_id: str,
-    *,
-    question_id: str,
-    page_id: str,
-    question_text: str,
-    x: float,
-    y: float,
-    width: float,
-    height: float,
-) -> dict[str, Any]:
-    with connection() as conn:
-        valid = conn.execute(
-            """
-            SELECT q.question_no
-            FROM evaluations e
-            JOIN student_submissions s ON s.id = e.submission_id
-            JOIN questions q
-              ON q.question_paper_id = s.question_paper_id
-             AND q.id = ?
-            JOIN submission_pages sp
-              ON sp.submission_id = s.id
-             AND sp.id = ?
-            WHERE e.id = ?
-            """,
-            (question_id, page_id, evaluation_id),
-        ).fetchone()
-        if not valid:
-            raise LookupError("Question or answer-sheet page was not found")
-
-        timestamp = now_iso()
-        analysis = (
-            f"Dummy AI Vision review for {valid['question_no']}: The selected "
-            "response area contains potentially relevant working. Compare the "
-            f"student's statements directly with the marking steps for: "
-            f"{question_text.strip()} Check terminology, completeness, and any "
-            "missing justification before awarding marks."
-        )
-    return {
-        "note_id": new_id("preview"),
-        "question_id": question_id,
-        "page_id": page_id,
-        "analysis": analysis,
-        "x": x,
-        "y": y,
-        "width": width,
-        "height": height,
-        "created_at": timestamp,
-    }
-
-
-def create_ai_vision_note(
-    evaluation_id: str, data: dict[str, Any]
-) -> dict[str, Any]:
-    with connection() as conn:
-        valid = conn.execute(
-            """
-            SELECT q.id
-            FROM evaluations e
-            JOIN student_submissions s ON s.id = e.submission_id
-            JOIN questions q
-              ON q.question_paper_id = s.question_paper_id
-             AND q.id = ?
-            JOIN submission_pages sp
-              ON sp.submission_id = s.id
-             AND sp.id = ?
-            WHERE e.id = ?
-            """,
-            (data["question_id"], data["page_id"], evaluation_id),
-        ).fetchone()
-        if not valid:
-            raise LookupError("Question or answer-sheet page was not found")
-
-        note_id = new_id("ai")
-        timestamp = now_iso()
-        conn.execute(
-            """
-            INSERT INTO ai_vision_notes (
-                id, evaluation_id, question_id, page_id, analysis,
-                x, y, width, height, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                note_id,
-                evaluation_id,
-                data["question_id"],
-                data["page_id"],
-                data["analysis"],
-                data["x"],
-                data["y"],
-                data["width"],
-                data["height"],
-                timestamp,
-            ),
-        )
-    return next(
-        note
-        for note in list_ai_vision_notes(evaluation_id) or []
-        if note["note_id"] == note_id
-    )
-
-
-def delete_ai_vision_note(evaluation_id: str, note_id: str) -> None:
-    with connection() as conn:
-        cursor = conn.execute(
-            """
-            DELETE FROM ai_vision_notes
-            WHERE id = ? AND evaluation_id = ?
-            """,
-            (note_id, evaluation_id),
-        )
-        if cursor.rowcount == 0:
-            raise LookupError("AI Vision note was not found")
 
 
 def focus_question(evaluation_id: str, question_id: str) -> dict[str, Any]:
