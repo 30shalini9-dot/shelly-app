@@ -91,14 +91,19 @@ class AnnotationUpdate(BaseModel):
     height: float | None = Field(default=None, gt=0, le=1)
 
 
-class AiVisionNoteCreate(BaseModel):
+class AiVisionAcceptRequest(BaseModel):
+    run_id: str = Field(pattern=r"^run_[a-f0-9]{12}$")
     question_id: str
     page_id: str
-    analysis: str = Field(min_length=1)
+    marks: list[float]
     x: float = Field(ge=0, le=1)
     y: float = Field(ge=0, le=1)
     width: float = Field(gt=0, le=1)
     height: float = Field(gt=0, le=1)
+
+
+class AiVisionRejectRequest(BaseModel):
+    run_id: str = Field(pattern=r"^run_[a-f0-9]{12}$")
 
 
 class SubmissionMetadata(BaseModel):

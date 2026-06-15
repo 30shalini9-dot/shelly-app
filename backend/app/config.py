@@ -14,6 +14,7 @@ def _resolve_path(env_name: str, default: str) -> Path:
 
 DATABASE_PATH = _resolve_path("SHELDON_DATABASE_PATH", "data/sheldon.db")
 UPLOAD_DIR = _resolve_path("SHELDON_UPLOAD_DIR", "data/uploads")
+AI_VISION_RUN_DIR = _resolve_path("SHELDON_AI_VISION_RUN_DIR", "data/ai_vision")
 SEED_DATA = os.getenv("SHELDON_SEED_DATA", "true").lower() in {"1", "true", "yes"}
 CORS_ORIGINS = [
     origin.strip()

@@ -1,20 +1,29 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Callable
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from . import database
-from .config import CORS_ORIGINS, SEED_DATA
+from .ai_vision import (
+    MODEL,
+    SYSTEM_PROMPT,
+    build_evaluation_prompt,
+    evaluate_answer,
+    normalize_step_marks,
+)
+from .config import AI_VISION_RUN_DIR, CORS_ORIGINS, SEED_DATA
 from .schemas import (
-    AiVisionNoteCreate,
+    AiVisionAcceptRequest,
+    AiVisionRejectRequest,
     AnnotationCreate,
     AnnotationUpdate,
     ChangeQuestionMappingRequest,
@@ -35,12 +44,72 @@ ALLOWED_IMAGE_TYPES = {
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 
 
+def _load_ai_vision_run(
+    root: Path,
+    run_id: str,
+    evaluation_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    run_dir = root / run_id
+    try:
+        metadata = json.loads((run_dir / "metadata.json").read_text("utf-8"))
+        result = json.loads((run_dir / "result.json").read_text("utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        raise LookupError("AI Vision run was not found or is incomplete") from exc
+    if metadata.get("evaluation_id") != evaluation_id:
+        raise LookupError("AI Vision run does not belong to this evaluation")
+    return metadata, result
+
+
+def _write_run_decision(
+    root: Path,
+    run_id: str,
+    evaluation_id: str,
+    decision: str,
+) -> None:
+    metadata, _ = _load_ai_vision_run(root, run_id, evaluation_id)
+    metadata["decision"] = decision
+    (root / run_id / "metadata.json").write_text(
+        json.dumps(metadata, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _record_run_error(
+    run_dir: Path,
+    metadata: dict[str, Any],
+    error: Exception,
+) -> None:
+    if not run_dir.exists():
+        return
+    metadata["status"] = "error"
+    metadata["error"] = str(error)
+    try:
+        (run_dir / "metadata.json").write_text(
+            json.dumps(metadata, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        (run_dir / "error.txt").write_text(str(error), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def create_app(
-    seed_data: bool = SEED_DATA, ai_delay_seconds: float = 5
+    seed_data: bool = SEED_DATA,
+    ai_delay_seconds: float = 0,
+    ai_evaluator: Callable[[str, str], dict[str, Any]] | None = None,
+    ai_vision_run_dir: Path = AI_VISION_RUN_DIR,
 ) -> FastAPI:
+    evaluate_image = ai_evaluator or (
+        lambda prompt, image_path: evaluate_answer(
+            question=prompt,
+            image_path=image_path,
+        )
+    )
+
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         database.initialize_database()
+        ai_vision_run_dir.mkdir(parents=True, exist_ok=True)
         if seed_data:
             seed_database()
         yield
@@ -302,37 +371,6 @@ def create_app(
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    @app.get("/evaluations/{evaluation_id}/ai-vision-notes")
-    def get_ai_vision_notes(evaluation_id: str) -> list[dict[str, Any]]:
-        notes = database.list_ai_vision_notes(evaluation_id)
-        if notes is None:
-            raise HTTPException(status_code=404, detail="Evaluation not found")
-        return notes
-
-    @app.post(
-        "/evaluations/{evaluation_id}/ai-vision-notes",
-        status_code=status.HTTP_201_CREATED,
-    )
-    def save_ai_vision_note(
-        evaluation_id: str, payload: AiVisionNoteCreate
-    ) -> dict[str, Any]:
-        try:
-            return database.create_ai_vision_note(
-                evaluation_id, payload.model_dump()
-            )
-        except LookupError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.delete(
-        "/evaluations/{evaluation_id}/ai-vision-notes/{note_id}",
-        status_code=status.HTTP_204_NO_CONTENT,
-    )
-    def delete_ai_vision_note(evaluation_id: str, note_id: str) -> None:
-        try:
-            database.delete_ai_vision_note(evaluation_id, note_id)
-        except LookupError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-
     @app.post(
         "/evaluations/{evaluation_id}/ai-vision",
         status_code=status.HTTP_201_CREATED,
@@ -341,7 +379,6 @@ def create_app(
         evaluation_id: str,
         question_id: Annotated[str, Form(min_length=1)],
         page_id: Annotated[str, Form(min_length=1)],
-        question_text: Annotated[str, Form(min_length=1)],
         x: Annotated[float, Form(ge=0, le=1)],
         y: Annotated[float, Form(ge=0, le=1)],
         width: Annotated[float, Form(gt=0, le=1)],
@@ -356,20 +393,202 @@ def create_app(
             raise HTTPException(status_code=422, detail="Crop image is empty")
         if len(crop_bytes) > MAX_UPLOAD_BYTES:
             raise HTTPException(status_code=413, detail="Crop exceeds 15 MB")
-        await asyncio.sleep(ai_delay_seconds)
+        question = database.get_question(evaluation_id, question_id)
+        if not question:
+            raise HTTPException(status_code=404, detail="Question not found")
+        pages = database.get_pages(evaluation_id)
+        if pages is None or not any(page["page_id"] == page_id for page in pages):
+            raise HTTPException(status_code=404, detail="Answer-sheet page not found")
+
+        prompt = build_evaluation_prompt(
+            question_text=question["question_text"],
+            reference_solution=question["reference_solution"],
+            steps=question["steps"],
+        )
+        suffix = {
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/webp": ".webp",
+            "image/gif": ".gif",
+            "image/svg+xml": ".svg",
+        }.get(content_type, ".img")
+        run_id = database.new_id("run")
+        run_dir = ai_vision_run_dir / run_id
+        image_path = run_dir / f"answer-selection{suffix}"
+        metadata = {
+            "run_id": run_id,
+            "evaluation_id": evaluation_id,
+            "question_id": question_id,
+            "question_no": question["question_no"],
+            "page_id": page_id,
+            "content_type": content_type,
+            "selection": {
+                "x": x,
+                "y": y,
+                "width": width,
+                "height": height,
+            },
+            "status": "running",
+        }
         try:
-            return database.preview_ai_vision_note(
+            run_dir.mkdir(parents=True, exist_ok=False)
+            image_path.write_bytes(crop_bytes)
+            (run_dir / "context.txt").write_text(
+                "\n\n".join(
+                    (
+                        f"Run ID:\n{run_id}",
+                        f"Model:\n{MODEL}",
+                        f"Image sent to Ollama:\n{image_path.resolve()}",
+                        f"System Prompt:\n{SYSTEM_PROMPT}",
+                        f"User Prompt:\n{prompt}",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (run_dir / "metadata.json").write_text(
+                json.dumps(metadata, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            if ai_delay_seconds:
+                await asyncio.sleep(ai_delay_seconds)
+            result = await asyncio.to_thread(
+                evaluate_image,
+                prompt,
+                str(image_path),
+            )
+            marks = normalize_step_marks(
+                result,
+                [step["max_marks"] for step in question["steps"]],
+            )
+            reasoning = str(result.get("reasoning", "")).strip()
+            (run_dir / "model-response.json").write_text(
+                json.dumps(
+                    result.get("raw_response", result),
+                    indent=2,
+                    ensure_ascii=False,
+                    default=str,
+                ),
+                encoding="utf-8",
+            )
+            normalized_result = {
+                "run_id": run_id,
+                "marks": marks,
+                "reasoning": reasoning,
+            }
+            (run_dir / "result.json").write_text(
+                json.dumps(normalized_result, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            metadata["status"] = "ready"
+            (run_dir / "metadata.json").write_text(
+                json.dumps(metadata, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except (ConnectionError, OSError, RuntimeError) as exc:
+            _record_run_error(run_dir, metadata, exc)
+            raise HTTPException(
+                status_code=503,
+                detail=f"Local AI Vision service is unavailable: {exc}",
+            ) from exc
+        except Exception as exc:
+            _record_run_error(run_dir, metadata, exc)
+            raise HTTPException(
+                status_code=502,
+                detail=f"AI Vision returned an invalid response: {exc}",
+            ) from exc
+
+        return {
+            "run_id": run_id,
+            "question_id": question_id,
+            "page_id": page_id,
+            "question_no": question["question_no"],
+            "marks": marks,
+            "steps": [
+                {
+                    "step_id": step["step_id"],
+                    "step_no": step["step_no"],
+                    "title": step["title"],
+                    "max_marks": step["max_marks"],
+                    "awarded_marks": mark,
+                }
+                for step, mark in zip(question["steps"], marks)
+            ],
+            "awarded_marks": sum(marks),
+            "max_marks": question["max_marks"],
+            "x": x,
+            "y": y,
+            "width": width,
+            "height": height,
+            # Reserved for a future rationale UI. The backend and run artifacts
+            # retain this value, but the current frontend intentionally hides it.
+            "reasoning": reasoning,
+        }
+
+    @app.post("/evaluations/{evaluation_id}/ai-vision/accept")
+    def accept_ai_vision_result(
+        evaluation_id: str,
+        payload: AiVisionAcceptRequest,
+    ) -> dict[str, Any]:
+        question = database.get_question(evaluation_id, payload.question_id)
+        if not question:
+            raise HTTPException(status_code=404, detail="Question not found")
+        try:
+            metadata, run_result = _load_ai_vision_run(
+                ai_vision_run_dir,
+                payload.run_id,
                 evaluation_id,
-                question_id=question_id,
-                page_id=page_id,
-                question_text=question_text,
-                x=x,
-                y=y,
-                width=width,
-                height=height,
+            )
+            if (
+                metadata.get("question_id") != payload.question_id
+                or metadata.get("page_id") != payload.page_id
+            ):
+                raise ValueError("AI Vision run does not match this question")
+            marks = normalize_step_marks(
+                run_result.get("marks", payload.marks),
+                [step["max_marks"] for step in question["steps"]],
+            )
+            selection = metadata.get("selection", {})
+            result = database.accept_ai_vision_marks(
+                evaluation_id,
+                question_id=payload.question_id,
+                page_id=payload.page_id,
+                marks=marks,
+                x=float(selection.get("x", payload.x)),
+                y=float(selection.get("y", payload.y)),
+                width=float(selection.get("width", payload.width)),
+                height=float(selection.get("height", payload.height)),
+                reasoning=str(run_result.get("reasoning", "")).strip(),
+            )
+            _write_run_decision(
+                ai_vision_run_dir,
+                payload.run_id,
+                evaluation_id,
+                "accepted",
+            )
+            return result
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/evaluations/{evaluation_id}/ai-vision/reject")
+    def reject_ai_vision_result(
+        evaluation_id: str,
+        payload: AiVisionRejectRequest,
+    ) -> dict[str, str]:
+        if not database.get_evaluation(evaluation_id):
+            raise HTTPException(status_code=404, detail="Evaluation not found")
+        try:
+            _write_run_decision(
+                ai_vision_run_dir,
+                payload.run_id,
+                evaluation_id,
+                "rejected",
             )
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"status": "rejected"}
 
     @app.post("/evaluations/{evaluation_id}/questions/{question_id}/next")
     def next_question(evaluation_id: str, question_id: str) -> dict[str, Any]:

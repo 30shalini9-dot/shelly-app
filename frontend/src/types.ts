@@ -98,14 +98,30 @@ export interface Annotation {
   height: number;
 }
 
-export interface AiVisionNote {
-  note_id: string;
+export interface AiVisionResult {
+  run_id: string;
   question_id: string;
   page_id: string;
-  analysis: string;
+  question_no: string;
+  marks: number[];
+  steps: Array<{
+    step_id: string;
+    step_no: number;
+    title: string;
+    max_marks: number;
+    awarded_marks: number;
+  }>;
+  awarded_marks: number;
+  max_marks: number;
   x: number;
   y: number;
   width: number;
   height: number;
-  created_at: string;
+  // Reserved for a future rationale view. Do not render this in the current UI.
+  reasoning?: string;
+}
+
+export interface AiVisionAcceptResponse {
+  question: Question;
+  annotation: Annotation;
 }

@@ -10,7 +10,8 @@ import {
 } from "react";
 import { API_BASE, api } from "../api";
 import type {
-  AiVisionNote,
+  AiVisionAcceptResponse,
+  AiVisionResult,
   Annotation,
   Evaluation,
   Page,
@@ -49,11 +50,11 @@ interface MarkAnnotationProps {
   onExpand: () => void;
 }
 
-interface AiNoteCardProps {
-  note: AiVisionNote;
-  onDelete: () => void;
-  onSave: () => void;
-  saveLabel?: string;
+interface AiResultCardProps {
+  result: AiVisionResult;
+  accepting: boolean;
+  onAccept: () => void;
+  onReject: () => void;
 }
 
 interface QuestionTotalSummary {
@@ -68,6 +69,7 @@ interface QuestionTotalSummary {
 }
 
 const TOTAL_ANNOTATION_PREFIX = "T|";
+const AI_TOTAL_ANNOTATION_PREFIX = "TAI|";
 const LEGACY_TOTAL_ANNOTATION_PREFIX = "TOTAL:";
 
 function formatMark(value: number) {
@@ -89,7 +91,10 @@ function serializeQuestionTotal(question: Question) {
 }
 
 function parseQuestionTotal(text: string): QuestionTotalSummary | null {
-  if (text.startsWith(TOTAL_ANNOTATION_PREFIX)) {
+  if (
+    text.startsWith(TOTAL_ANNOTATION_PREFIX) ||
+    text.startsWith(AI_TOTAL_ANNOTATION_PREFIX)
+  ) {
     const [, questionNo, stepText, totalText] = text.split("|");
     const total = totalText?.split("/").map(Number);
     const steps = stepText
@@ -330,25 +335,67 @@ function drawExportTotal(
     right,
     textY,
   );
+  if (annotation.text.startsWith(AI_TOTAL_ANNOTATION_PREFIX)) {
+    context.fillStyle = "#ffffff";
+    context.strokeStyle = "#075f59";
+    context.beginPath();
+    context.arc(right - 7 * scale, y + 12 * scale, 9 * scale, 0, Math.PI * 2);
+    context.fill();
+    context.stroke();
+    context.fillStyle = "#075f59";
+    context.font = `800 ${7 * scale}px Arial, sans-serif`;
+    context.textAlign = "center";
+    context.fillText("AI", right - 7 * scale, y + 14.5 * scale);
+  }
   context.restore();
 }
 
-function AiNoteCard({
-  note,
-  onDelete,
-  onSave,
-  saveLabel = "Save",
-}: AiNoteCardProps) {
+function AiResultCard({
+  result,
+  accepting,
+  onAccept,
+  onReject,
+}: AiResultCardProps) {
   return (
-    <div className="ai-note-card">
-      <strong>AI Vision reference</strong>
-      <p>{note.analysis}</p>
-      <div className="ai-note-actions">
-        <button className="ai-note-save" onClick={onSave} type="button">
-          {saveLabel}
+    <div className="ai-result-card">
+      <div className="ai-result-heading">
+        <span className="ai-result-badge">AI</span>
+        <strong>{result.question_no} suggested marks</strong>
+      </div>
+      <div className="ai-result-steps">
+        {result.steps.map((step) => (
+          <span key={step.step_id}>
+            <small>
+              S{step.step_no} · {step.title}
+            </small>
+            <strong>
+              {formatMark(step.awarded_marks)}/{formatMark(step.max_marks)}
+            </strong>
+          </span>
+        ))}
+      </div>
+      <div className="ai-result-total">
+        <span>Total</span>
+        <strong>
+          {formatMark(result.awarded_marks)}/{formatMark(result.max_marks)}
+        </strong>
+      </div>
+      <div className="ai-result-actions">
+        <button
+          className="ai-result-accept"
+          disabled={accepting}
+          onClick={onAccept}
+          type="button"
+        >
+          {accepting ? "Accepting…" : "Accept marks"}
         </button>
-        <button className="ai-note-delete" onClick={onDelete} type="button">
-          Delete
+        <button
+          className="ai-result-reject"
+          disabled={accepting}
+          onClick={onReject}
+          type="button"
+        >
+          Reject
         </button>
       </div>
     </div>
@@ -400,6 +447,9 @@ function QuestionTotalAnnotation({
   onMove,
 }: QuestionTotalAnnotationProps) {
   const summary = parseQuestionTotal(annotation.text);
+  const isAiGenerated = annotation.text.startsWith(
+    AI_TOTAL_ANNOTATION_PREFIX,
+  );
   const dragRef = useRef<{
     pointerId: number;
     startClientX: number;
@@ -503,7 +553,10 @@ function QuestionTotalAnnotation({
     >
       {expanded ? (
         <>
-          <span className="question-total-heading">{summary.questionNo}</span>
+          <span className="question-total-heading">
+            {summary.questionNo}
+            {isAiGenerated && <span className="question-total-ai">AI</span>}
+          </span>
           <span className="question-total-steps">
             {summary.steps.map((step) => (
               <span key={step.stepNo}>
@@ -523,6 +576,7 @@ function QuestionTotalAnnotation({
         </>
       ) : (
         <>
+          {isAiGenerated && <span className="question-total-ai">AI</span>}
           <strong>{summary.questionNo}:</strong>
           <span>
             {formatMark(summary.awarded)}/{formatMark(summary.max)}
@@ -543,9 +597,9 @@ export function EvaluationWorkspace({
   const [question, setQuestion] = useState<Question | null>(null);
   const [progress, setProgress] = useState<Progress | null>(null);
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
-  const [aiNotes, setAiNotes] = useState<AiVisionNote[]>([]);
-  const [pendingAiNote, setPendingAiNote] = useState<AiVisionNote | null>(null);
-  const [expandedNotes, setExpandedNotes] = useState<Set<string>>(new Set());
+  const [pendingAiResult, setPendingAiResult] =
+    useState<AiVisionResult | null>(null);
+  const [acceptingAiResult, setAcceptingAiResult] = useState(false);
   const [zoom, setZoom] = useState(0.82);
   const [rotation, setRotation] = useState(0);
   const [leftOpen, setLeftOpen] = useState(true);
@@ -589,21 +643,18 @@ export function EvaluationWorkspace({
       questionData,
       progressData,
       annotationData,
-      aiNoteData,
     ] = await Promise.all([
       api<Evaluation>(`/evaluations/${evaluationId}`),
       api<Page[]>(`/evaluations/${evaluationId}/pages`),
       api<Question[]>(`/evaluations/${evaluationId}/questions`),
       api<Progress>(`/evaluations/${evaluationId}/progress`),
       api<Annotation[]>(`/evaluations/${evaluationId}/annotations`),
-      api<AiVisionNote[]>(`/evaluations/${evaluationId}/ai-vision-notes`),
     ]);
     setEvaluation(evaluationData);
     setPages(pageData);
     setQuestions(questionData);
     setProgress(progressData);
     setAnnotations(annotationData);
-    setAiNotes(aiNoteData);
     return questionData;
   }, [evaluationId]);
 
@@ -1058,20 +1109,19 @@ export function EvaluationWorkspace({
       const formData = new FormData();
       formData.append("question_id", question.question_id);
       formData.append("page_id", selection.pageId);
-      formData.append("question_text", question.question_text);
       formData.append("x", String(selection.x));
       formData.append("y", String(selection.y));
       formData.append("width", String(selection.width));
       formData.append("height", String(selection.height));
       formData.append("crop", crop, "answer-selection.png");
-      const note = await api<AiVisionNote>(
+      const result = await api<AiVisionResult>(
         `/evaluations/${evaluationId}/ai-vision`,
         { method: "POST", body: formData },
       );
       setAiSelection(null);
       setToolMode(null);
-      setPendingAiNote(note);
-      setNotice("AI Vision analysis is ready. Save or delete the note.");
+      setPendingAiResult(result);
+      setNotice("AI Vision marks are ready. Accept or reject the suggestion.");
     } catch (error) {
       setAiSelection(null);
       setToolMode(null);
@@ -1103,67 +1153,58 @@ export function EvaluationWorkspace({
     void analyzeAiSelection(event.currentTarget, selection);
   };
 
-  const toggleAiNote = (noteId: string) => {
-    setExpandedNotes((current) => {
-      const next = new Set(current);
-      if (next.has(noteId)) next.delete(noteId);
-      else next.add(noteId);
-      return next;
-    });
-  };
-
-  const savePendingAiNote = async () => {
-    if (!pendingAiNote) return;
+  const acceptPendingAiResult = async () => {
+    if (!pendingAiResult) return;
+    setAcceptingAiResult(true);
     try {
-      const savedNote = await api<AiVisionNote>(
-        `/evaluations/${evaluationId}/ai-vision-notes`,
+      const result = await api<AiVisionAcceptResponse>(
+        `/evaluations/${evaluationId}/ai-vision/accept`,
         {
           method: "POST",
           body: JSON.stringify({
-            question_id: pendingAiNote.question_id,
-            page_id: pendingAiNote.page_id,
-            analysis: pendingAiNote.analysis,
-            x: pendingAiNote.x,
-            y: pendingAiNote.y,
-            width: pendingAiNote.width,
-            height: pendingAiNote.height,
+            run_id: pendingAiResult.run_id,
+            question_id: pendingAiResult.question_id,
+            page_id: pendingAiResult.page_id,
+            marks: pendingAiResult.marks,
+            x: pendingAiResult.x,
+            y: pendingAiResult.y,
+            width: pendingAiResult.width,
+            height: pendingAiResult.height,
           }),
         },
       );
-      setAiNotes((current) => [...current, savedNote]);
-      setPendingAiNote(null);
-      setNotice("AI Vision note saved.");
+      setPendingAiResult(null);
+      await refreshQuestionState(result.question.question_id);
+      expandQuestionTotal(result.annotation.annotation_id);
+      setNotice(
+        `${result.question.question_no} AI marks accepted: ${formatMark(
+          result.question.awarded_marks,
+        )}/${formatMark(result.question.max_marks)}.`,
+      );
+      await moveToNextQuestion(result.question.question_id);
     } catch (error) {
       setNotice(
-        error instanceof Error ? error.message : "Unable to save AI Vision note",
+        error instanceof Error ? error.message : "Unable to accept AI marks",
       );
+    } finally {
+      setAcceptingAiResult(false);
     }
   };
 
-  const deleteAiNote = async (note: AiVisionNote, saved: boolean) => {
+  const rejectPendingAiResult = async () => {
+    if (!pendingAiResult) return;
     try {
-      if (saved) {
-        await api<void>(
-          `/evaluations/${evaluationId}/ai-vision-notes/${note.note_id}`,
-          { method: "DELETE" },
-        );
-        setAiNotes((current) =>
-          current.filter((item) => item.note_id !== note.note_id),
-        );
-        setExpandedNotes((current) => {
-          const next = new Set(current);
-          next.delete(note.note_id);
-          return next;
-        });
-      } else {
-        setPendingAiNote(null);
-      }
-      setNotice("AI Vision note deleted.");
+      await api(`/evaluations/${evaluationId}/ai-vision/reject`, {
+        method: "POST",
+        body: JSON.stringify({ run_id: pendingAiResult.run_id }),
+      });
+      setPendingAiResult(null);
+      setNotice("AI Vision marks rejected. No marks were changed.");
     } catch (error) {
       setNotice(
         error instanceof Error
           ? error.message
-          : "Unable to delete AI Vision note",
+          : "Unable to reject AI Vision marks",
       );
     }
   };
@@ -1529,13 +1570,12 @@ export function EvaluationWorkspace({
               const pageAnnotations = annotations.filter(
                 (annotation) => annotation.page_id === page.page_id,
               );
-              const pageAiNotes = aiNotes.filter(
-                (note) => note.page_id === page.page_id,
-              );
               const selection =
                 aiSelection?.pageId === page.page_id ? aiSelection : null;
-              const pendingNote =
-                pendingAiNote?.page_id === page.page_id ? pendingAiNote : null;
+              const pendingResult =
+                pendingAiResult?.page_id === page.page_id
+                  ? pendingAiResult
+                  : null;
               return (
                 <div className="answer-page-frame" key={page.page_id}>
                   <span className="page-number-label">
@@ -1600,51 +1640,23 @@ export function EvaluationWorkspace({
                         />
                       ),
                     )}
-                    {pageAiNotes.map((note) => (
+                    {pendingResult && (
                       <div
-                        className={`ai-note-marker ${
-                          expandedNotes.has(note.note_id) ? "expanded" : ""
-                        }`}
-                        key={note.note_id}
-                        onContextMenu={(event) => event.stopPropagation()}
-                        onClick={(event) => event.stopPropagation()}
-                        style={{
-                          top: `${note.y * 100}%`,
-                        }}
-                      >
-                        <button
-                          className="ai-note-icon"
-                          onClick={() => toggleAiNote(note.note_id)}
-                          title="Open AI Vision note"
-                          type="button"
-                        >
-                          AI
-                        </button>
-                        {expandedNotes.has(note.note_id) && (
-                          <AiNoteCard
-                            note={note}
-                            onDelete={() => void deleteAiNote(note, true)}
-                            onSave={() => toggleAiNote(note.note_id)}
-                          />
-                        )}
-                      </div>
-                    ))}
-                    {pendingNote && (
-                      <div
-                        className="ai-note-response"
+                        className="ai-result-response"
                         onClick={(event) => event.stopPropagation()}
                         onContextMenu={(event) => event.stopPropagation()}
                         style={{
                           top: `${Math.min(
                             0.82,
-                            pendingNote.y + pendingNote.height,
+                            pendingResult.y + pendingResult.height,
                           ) * 100}%`,
                         }}
                       >
-                        <AiNoteCard
-                          note={pendingNote}
-                          onDelete={() => void deleteAiNote(pendingNote, false)}
-                          onSave={() => void savePendingAiNote()}
+                        <AiResultCard
+                          accepting={acceptingAiResult}
+                          onAccept={() => void acceptPendingAiResult()}
+                          onReject={() => void rejectPendingAiResult()}
+                          result={pendingResult}
                         />
                       </div>
                     )}
@@ -1826,8 +1838,8 @@ export function EvaluationWorkspace({
               className="context-ai"
               onClick={() => {
                 setMenu(null);
-                if (pendingAiNote) {
-                  setNotice("Save or delete the current AI Vision note first.");
+                if (pendingAiResult) {
+                  setNotice("Accept or reject the current AI marks first.");
                   return;
                 }
                 setToolMode("ai-select");
