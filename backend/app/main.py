@@ -5,14 +5,31 @@ import json
 import shutil
 import sqlite3
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Callable
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from . import database
+from .agent_workflow import (
+    fetch_cornerstone_status,
+    fetch_agent_image,
+    submit_cornerstone_job,
+    valid_cornerstone_signature,
+)
 from .ai_vision import (
     MODEL,
     SYSTEM_PROMPT,
@@ -20,7 +37,16 @@ from .ai_vision import (
     evaluate_answer,
     normalize_step_marks,
 )
-from .config import AI_VISION_RUN_DIR, CORS_ORIGINS, SEED_DATA
+from .config import (
+    AGENT_DUMMY_FULL_MARKS,
+    AGENT_JOB_RUN_DIR,
+    AI_VISION_RUN_DIR,
+    CORNERSTONE_API_URL,
+    CORNERSTONE_WEBHOOK_SECRET,
+    CORS_ORIGINS,
+    PUBLIC_API_URL,
+    SEED_DATA,
+)
 from .schemas import (
     AiVisionAcceptRequest,
     AiVisionRejectRequest,
@@ -42,6 +68,22 @@ ALLOWED_IMAGE_TYPES = {
     "image/svg+xml",
 }
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+
+
+def _dummy_full_marks_result(
+    question: dict[str, Any],
+    *,
+    mode: str,
+    image_count: int = 0,
+) -> dict[str, Any]:
+    return {
+        "marks": [step["max_marks"] for step in question["steps"]],
+        "reasoning": f"Dummy {mode} assigned full marks for testing.",
+        "raw_response": {
+            "mode": "dummy_full_marks",
+            "image_count": image_count,
+        },
+    }
 
 
 def _load_ai_vision_run(
@@ -96,8 +138,13 @@ def _record_run_error(
 def create_app(
     seed_data: bool = SEED_DATA,
     ai_delay_seconds: float = 0,
-    ai_evaluator: Callable[[str, str], dict[str, Any]] | None = None,
+    ai_evaluator: Callable[[str, str | list[str]], dict[str, Any]] | None = None,
     ai_vision_run_dir: Path = AI_VISION_RUN_DIR,
+    cornerstone_submitter: Callable[..., dict[str, Any]] | None = None,
+    agent_image_fetcher: Callable[[str], tuple[bytes, str]] | None = None,
+    cornerstone_status_fetcher: Callable[..., dict[str, Any]] | None = None,
+    agent_dummy_full_marks: bool = AGENT_DUMMY_FULL_MARKS,
+    agent_job_run_dir: Path = AGENT_JOB_RUN_DIR,
 ) -> FastAPI:
     evaluate_image = ai_evaluator or (
         lambda prompt, image_path: evaluate_answer(
@@ -105,11 +152,387 @@ def create_app(
             image_path=image_path,
         )
     )
+    submit_extraction = cornerstone_submitter or submit_cornerstone_job
+    fetch_enhanced_image = agent_image_fetcher or fetch_agent_image
+    fetch_extraction_status = cornerstone_status_fetcher or fetch_cornerstone_status
+
+    def write_agent_artifact(
+        agent_job_id: str,
+        name: str,
+        payload: dict[str, Any],
+    ) -> None:
+        safe_name = "".join(
+            character if character.isalnum() or character in {"-", "_"} else "-"
+            for character in name.strip().lower()
+        ).strip("-") or "payload"
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        try:
+            job_dir = agent_job_run_dir / agent_job_id
+            job_dir.mkdir(parents=True, exist_ok=True)
+            artifact = {
+                "agent_job_id": agent_job_id,
+                "name": safe_name,
+                "stored_at": datetime.now(timezone.utc).isoformat(),
+                "payload": payload,
+            }
+            (job_dir / f"{timestamp}-{safe_name}.json").write_text(
+                json.dumps(artifact, indent=2, ensure_ascii=False, default=str),
+                encoding="utf-8",
+            )
+            (job_dir / "latest.json").write_text(
+                json.dumps(artifact, indent=2, ensure_ascii=False, default=str),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    def agent_response(evaluation_id: str) -> dict[str, Any]:
+        job = database.get_agent_job_for_evaluation(evaluation_id)
+        if not job:
+            return {"enabled": False, "reviews": []}
+        return {"enabled": True, **job}
+
+    async def start_agent_job(agent_job_id: str) -> None:
+        pages = database.get_agent_job_pages(agent_job_id)
+        if not pages:
+            database.update_agent_job(
+                agent_job_id,
+                status="failed",
+                error="No answer-sheet pages were found",
+                completed=True,
+            )
+            return
+        try:
+            result = await asyncio.to_thread(
+                submit_extraction,
+                base_url=CORNERSTONE_API_URL,
+                pages=pages,
+                webhook_url=f"{PUBLIC_API_URL}/agent-jobs/cornerstone/webhook",
+                webhook_secret=CORNERSTONE_WEBHOOK_SECRET,
+            )
+            cornerstone_job_id = str(result.get("job_id", "")).strip()
+            if not cornerstone_job_id:
+                raise ValueError("Cornerstone did not return a job_id")
+            write_agent_artifact(agent_job_id, "cornerstone-submit", result)
+            database.update_agent_job(
+                agent_job_id,
+                status="extracting",
+                cornerstone_job_id=cornerstone_job_id,
+                cornerstone_status_url=result.get("status_url"),
+                clear_error=True,
+            )
+        except Exception as exc:
+            database.update_agent_job(
+                agent_job_id,
+                status="failed",
+                error=f"Cornerstone submission failed: {exc}",
+                completed=True,
+            )
+
+    async def evaluate_agent_job(
+        agent_job_id: str,
+        cornerstone_questions: list[dict[str, Any]],
+    ) -> None:
+        job = database.get_agent_job_by_id(agent_job_id)
+        if not job:
+            return
+        try:
+            reviews = database.prepare_agent_reviews(
+                agent_job_id,
+                cornerstone_questions,
+            )
+        except Exception as exc:
+            database.update_agent_job(
+                agent_job_id,
+                status="failed",
+                error=f"Unable to map Cornerstone questions: {exc}",
+                completed=True,
+            )
+            return
+
+        ready_count = 0
+        for index, review in enumerate(reviews, start=1):
+            run_dir: Path | None = None
+            metadata: dict[str, Any] = {}
+            try:
+                question = database.get_question(
+                    job["evaluation_id"],
+                    review["question_id"],
+                )
+                if not question:
+                    raise LookupError("Mapped question was not found")
+                if not review["page_id"]:
+                    raise ValueError("Question did not map to an uploaded page")
+                if not agent_dummy_full_marks and not review["area_urls"]:
+                    raise ValueError("Cornerstone returned no enhanced answer segments")
+
+                database.update_agent_review(review["id"], status="evaluating")
+                run_id = database.new_id("run")
+                run_dir = ai_vision_run_dir / run_id
+                run_dir.mkdir(parents=True, exist_ok=False)
+                image_paths: list[Path] = []
+                for area_index, image_url in enumerate(review["area_urls"], start=1):
+                    try:
+                        image_bytes, content_type = await asyncio.to_thread(
+                            fetch_enhanced_image,
+                            image_url,
+                        )
+                        if not image_bytes:
+                            raise ValueError(
+                                f"Enhanced answer segment {area_index} was empty"
+                            )
+                    except Exception:
+                        if agent_dummy_full_marks:
+                            continue
+                        raise
+                    suffix = {
+                        "image/jpeg": ".jpg",
+                        "image/png": ".png",
+                        "image/webp": ".webp",
+                    }.get(content_type.split(";")[0].lower(), ".png")
+                    image_path = run_dir / f"answer-segment-{area_index:03d}{suffix}"
+                    image_path.write_bytes(image_bytes)
+                    image_paths.append(image_path)
+
+                prompt = build_evaluation_prompt(
+                    question_text=question["question_text"],
+                    reference_solution=question["reference_solution"],
+                    steps=question["steps"],
+                )
+                bbox = review["bbox"] or {"x": 0, "y": 0, "w": 1, "h": 1}
+                metadata = {
+                    "run_id": run_id,
+                    "source": "agent",
+                    "agent_job_id": agent_job_id,
+                    "agent_review_id": review["id"],
+                    "evaluation_id": job["evaluation_id"],
+                    "question_id": question["question_id"],
+                    "question_no": question["question_no"],
+                    "page_id": review["page_id"],
+                    "content_type": "image/png",
+                    "image_urls": review["area_urls"],
+                    "selection": {
+                        "x": bbox["x"],
+                        "y": bbox["y"],
+                        "width": bbox["w"],
+                        "height": bbox["h"],
+                    },
+                    "status": "running",
+                }
+                (run_dir / "context.txt").write_text(
+                    "\n\n".join(
+                        (
+                            f"Run ID:\n{run_id}",
+                            f"Model:\n{MODEL}",
+                            "Enhanced images available for AI Vision:\n"
+                            + (
+                                "\n".join(
+                                    str(path.resolve()) for path in image_paths
+                                )
+                                if image_paths
+                                else "none"
+                            ),
+                            f"System Prompt:\n{SYSTEM_PROMPT}",
+                            f"User Prompt:\n{prompt}",
+                        )
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                (run_dir / "metadata.json").write_text(
+                    json.dumps(metadata, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                if ai_delay_seconds:
+                    await asyncio.sleep(ai_delay_seconds)
+                if agent_dummy_full_marks:
+                    result = _dummy_full_marks_result(
+                        question,
+                        mode="agent mode",
+                        image_count=len(image_paths),
+                    )
+                else:
+                    image_input: str | list[str] = (
+                        str(image_paths[0])
+                        if len(image_paths) == 1
+                        else [str(path) for path in image_paths]
+                    )
+                    result = await asyncio.to_thread(
+                        evaluate_image,
+                        prompt,
+                        image_input,
+                    )
+                marks = normalize_step_marks(
+                    result,
+                    [step["max_marks"] for step in question["steps"]],
+                )
+                reasoning = str(result.get("reasoning", "")).strip()
+                (run_dir / "model-response.json").write_text(
+                    json.dumps(
+                        result.get("raw_response", result),
+                        indent=2,
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                    encoding="utf-8",
+                )
+                (run_dir / "result.json").write_text(
+                    json.dumps(
+                        {
+                            "run_id": run_id,
+                            "marks": marks,
+                            "reasoning": reasoning,
+                        },
+                        indent=2,
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                metadata["status"] = "ready"
+                (run_dir / "metadata.json").write_text(
+                    json.dumps(metadata, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                database.update_agent_review(
+                    review["id"],
+                    status="ready",
+                    run_id=run_id,
+                    marks=marks,
+                    awarded_marks=sum(marks),
+                )
+                ready_count += 1
+            except Exception as exc:
+                if run_dir is not None:
+                    _record_run_error(run_dir, metadata, exc)
+                database.update_agent_review(
+                    review["id"],
+                    status="error",
+                    error=str(exc),
+                )
+            finally:
+                database.update_agent_job(
+                    agent_job_id,
+                    processed_questions=index,
+                )
+
+        database.update_agent_job(
+            agent_job_id,
+            status="ready" if ready_count or not reviews else "failed",
+            error=(
+                None
+                if ready_count == len(reviews)
+                else f"{len(reviews) - ready_count} question evaluations failed"
+            ),
+            completed=True,
+        )
+
+    def extract_cornerstone_result(
+        payload: dict[str, Any],
+    ) -> tuple[
+        str,
+        int,
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        str | None,
+    ]:
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        result = data.get("result") if isinstance(data.get("result"), dict) else data
+        status_value = str(
+            result.get("status")
+            or data.get("status")
+            or payload.get("status")
+            or ""
+        ).lower()
+        if status_value == "failed":
+            error = (
+                result.get("error")
+                or data.get("error")
+                or payload.get("error")
+                or "Cornerstone job failed"
+            )
+            return "failed", 0, [], [], str(error)
+        if status_value != "done":
+            return "processing", 0, [], [], None
+
+        pages = result.get("pages") or []
+        questions = result.get("questions") or []
+        pages = [page for page in pages if isinstance(page, dict)]
+        questions = [question for question in questions if isinstance(question, dict)]
+        detected_raw = (
+            result.get("question_count")
+            or result.get("detected_questions")
+            or data.get("question_count")
+        )
+        try:
+            detected = int(detected_raw) if detected_raw is not None else len(questions)
+        except (TypeError, ValueError):
+            detected = len(questions)
+        return "done", detected, pages, questions, None
+
+    async def process_cornerstone_payload(
+        job: dict[str, Any],
+        payload: dict[str, Any],
+        background_tasks: BackgroundTasks,
+        *,
+        artifact_name: str,
+    ) -> None:
+        write_agent_artifact(job["id"], artifact_name, payload)
+        state, detected_questions, pages, questions, error = extract_cornerstone_result(
+            payload
+        )
+        if state == "processing":
+            return
+        if state == "failed":
+            database.update_agent_job(
+                job["id"],
+                status="failed",
+                error=error or "Cornerstone job failed",
+                completed=True,
+            )
+            return
+
+        selected_questions = questions[: job["expected_questions"]]
+        try:
+            database.update_agent_page_images(
+                job["evaluation_id"],
+                pages,
+                selected_questions,
+            )
+        except Exception as exc:
+            database.update_agent_job(
+                job["id"],
+                status="failed",
+                error=f"Unable to store enhanced page images: {exc}",
+                completed=True,
+            )
+            return
+        database.update_agent_job(
+            job["id"],
+            status="evaluating",
+            detected_questions=detected_questions,
+            clear_error=True,
+        )
+        background_tasks.add_task(evaluate_agent_job, job["id"], selected_questions)
+
+    def finish_agent_job_if_decided(evaluation_id: str) -> None:
+        job = database.get_agent_job_for_evaluation(evaluation_id)
+        if not job:
+            return
+        pending = {
+            "queued",
+            "evaluating",
+            "ready",
+        }
+        if job["reviews"] and not any(
+            review["status"] in pending for review in job["reviews"]
+        ):
+            database.update_agent_job(job["id"], status="completed", completed=True)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         database.initialize_database()
         ai_vision_run_dir.mkdir(parents=True, exist_ok=True)
+        agent_job_run_dir.mkdir(parents=True, exist_ok=True)
         if seed_data:
             seed_database()
         yield
@@ -188,12 +611,14 @@ def create_app(
 
     @app.post("/submissions", status_code=status.HTTP_201_CREATED)
     async def add_submission(
+        background_tasks: BackgroundTasks,
         student_id: Annotated[str, Form(min_length=1)],
         paper_code: Annotated[str, Form(min_length=1)],
         images: Annotated[list[UploadFile], File(min_length=1)],
         student_name: Annotated[str | None, Form()] = None,
         assigned_evaluator_id: Annotated[str, Form()] = "eval_001",
         evaluation_batch: Annotated[str, Form()] = "Default",
+        agent_mode: Annotated[bool, Form()] = False,
     ) -> dict[str, Any]:
         upload_batch = database.new_id("upload")
         upload_dir = database.UPLOAD_DIR / upload_batch
@@ -223,14 +648,22 @@ def create_app(
                         "content_type": content_type,
                     }
                 )
-            return database.create_submission(
+            evaluation = database.create_submission(
                 student_id=student_id.strip(),
                 student_name=student_name.strip() if student_name else None,
                 paper_code=paper_code.strip(),
                 assigned_evaluator_id=assigned_evaluator_id.strip(),
                 evaluation_batch=evaluation_batch.strip(),
                 pages=saved_pages,
+                agent_mode=agent_mode,
             )
+            if agent_mode:
+                agent_job = database.get_agent_job_for_evaluation(
+                    evaluation["evaluation_id"]
+                )
+                if agent_job:
+                    background_tasks.add_task(start_agent_job, agent_job["id"])
+            return evaluation
         except LookupError as exc:
             shutil.rmtree(upload_dir, ignore_errors=True)
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -280,6 +713,104 @@ def create_app(
         if questions is None:
             raise HTTPException(status_code=404, detail="Evaluation not found")
         return questions
+
+    @app.get("/evaluations/{evaluation_id}/agent")
+    def get_agent_job(evaluation_id: str) -> dict[str, Any]:
+        evaluation = database.get_evaluation(evaluation_id)
+        if not evaluation:
+            raise HTTPException(status_code=404, detail="Evaluation not found")
+        return agent_response(evaluation_id)
+
+    @app.post("/evaluations/{evaluation_id}/agent/start")
+    async def start_agent_for_evaluation(evaluation_id: str) -> dict[str, Any]:
+        evaluation = database.get_evaluation(evaluation_id)
+        if not evaluation:
+            raise HTTPException(status_code=404, detail="Evaluation not found")
+        try:
+            job = database.ensure_agent_job(evaluation_id)
+            database.reset_agent_job_for_start(job["id"])
+            await start_agent_job(job["id"])
+            return agent_response(evaluation_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/evaluations/{evaluation_id}/agent/sync")
+    async def sync_agent_for_evaluation(
+        evaluation_id: str,
+        background_tasks: BackgroundTasks,
+    ) -> dict[str, Any]:
+        evaluation = database.get_evaluation(evaluation_id)
+        if not evaluation:
+            raise HTTPException(status_code=404, detail="Evaluation not found")
+        job = database.get_agent_job_for_evaluation(evaluation_id)
+        if not job:
+            return {"enabled": False, "reviews": []}
+        if job.get("status") != "extracting" or not job.get("cornerstone_job_id"):
+            return {"enabled": True, **job}
+        try:
+            payload = await asyncio.to_thread(
+                fetch_extraction_status,
+                base_url=CORNERSTONE_API_URL,
+                job_id=job["cornerstone_job_id"],
+                status_url=job.get("cornerstone_status_url"),
+            )
+            await process_cornerstone_payload(
+                job,
+                payload,
+                background_tasks,
+                artifact_name="cornerstone-sync",
+            )
+            return agent_response(evaluation_id)
+        except Exception as exc:
+            database.update_agent_job(
+                job["id"],
+                status="failed",
+                error=f"Cornerstone status polling failed: {exc}",
+                completed=True,
+            )
+            return agent_response(evaluation_id)
+
+    @app.post("/agent-jobs/cornerstone/webhook", status_code=204)
+    @app.post("/api/cornerstone/webhook", status_code=204)
+    async def cornerstone_webhook(
+        request: Request,
+        background_tasks: BackgroundTasks,
+    ) -> Response:
+        body = await request.body()
+        supplied_signature = request.headers.get("X-Cornerstone-Signature", "")
+        if CORNERSTONE_WEBHOOK_SECRET and not valid_cornerstone_signature(
+            body,
+            supplied_signature,
+            CORNERSTONE_WEBHOOK_SECRET,
+        ):
+            raise HTTPException(status_code=401, detail="Invalid Cornerstone signature")
+        try:
+            event = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid Cornerstone webhook JSON",
+            ) from exc
+
+        cornerstone_job_id = str(event.get("job_id", "")).strip()
+        if not cornerstone_job_id and isinstance(event.get("data"), dict):
+            cornerstone_job_id = str(event["data"].get("job_id", "")).strip()
+            if not cornerstone_job_id and isinstance(event["data"].get("result"), dict):
+                cornerstone_job_id = str(
+                    event["data"]["result"].get("job_id", "")
+                ).strip()
+        if not cornerstone_job_id and isinstance(event.get("result"), dict):
+            cornerstone_job_id = str(event["result"].get("job_id", "")).strip()
+        job = database.get_agent_job_by_cornerstone_id(cornerstone_job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Agent job not found")
+        await process_cornerstone_payload(
+            job,
+            event,
+            background_tasks,
+            artifact_name="cornerstone-webhook",
+        )
+        return Response(status_code=204)
 
     @app.get("/evaluations/{evaluation_id}/questions/{question_id}")
     def get_question(evaluation_id: str, question_id: str) -> dict[str, Any]:
@@ -452,11 +983,18 @@ def create_app(
             )
             if ai_delay_seconds:
                 await asyncio.sleep(ai_delay_seconds)
-            result = await asyncio.to_thread(
-                evaluate_image,
-                prompt,
-                str(image_path),
-            )
+            if agent_dummy_full_marks:
+                result = _dummy_full_marks_result(
+                    question,
+                    mode="AI Vision",
+                    image_count=1,
+                )
+            else:
+                result = await asyncio.to_thread(
+                    evaluate_image,
+                    prompt,
+                    str(image_path),
+                )
             marks = normalize_step_marks(
                 result,
                 [step["max_marks"] for step in question["steps"]],
@@ -589,6 +1127,100 @@ def create_app(
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"status": "rejected"}
+
+    @app.post(
+        "/evaluations/{evaluation_id}/agent/reviews/{review_id}/accept"
+    )
+    def accept_agent_review(
+        evaluation_id: str,
+        review_id: str,
+    ) -> dict[str, Any]:
+        review = database.get_agent_review(evaluation_id, review_id)
+        if not review:
+            raise HTTPException(status_code=404, detail="Agent review not found")
+        if review["status"] != "ready" or not review["run_id"]:
+            raise HTTPException(
+                status_code=409,
+                detail="Agent review is not ready for acceptance",
+            )
+        question = database.get_question(evaluation_id, review["question_id"])
+        if not question or not review["page_id"]:
+            raise HTTPException(status_code=404, detail="Mapped question was not found")
+        try:
+            metadata, run_result = _load_ai_vision_run(
+                ai_vision_run_dir,
+                review["run_id"],
+                evaluation_id,
+            )
+            marks = normalize_step_marks(
+                run_result.get("marks", review["marks"]),
+                [step["max_marks"] for step in question["steps"]],
+            )
+            selection = metadata.get("selection", {})
+            result = database.accept_ai_vision_marks(
+                evaluation_id,
+                question_id=review["question_id"],
+                page_id=review["page_id"],
+                marks=marks,
+                x=float(selection.get("x", 0)),
+                y=float(selection.get("y", 0)),
+                width=float(selection.get("width", 1)),
+                height=float(selection.get("height", 1)),
+                reasoning=str(run_result.get("reasoning", "")).strip(),
+            )
+            _write_run_decision(
+                ai_vision_run_dir,
+                review["run_id"],
+                evaluation_id,
+                "accepted",
+            )
+            database.update_agent_review(review_id, status="accepted")
+            finish_agent_job_if_decided(evaluation_id)
+            return {
+                **result,
+                "agent": {
+                    "enabled": True,
+                    **(database.get_agent_job_for_evaluation(evaluation_id) or {}),
+                },
+            }
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post(
+        "/evaluations/{evaluation_id}/agent/reviews/{review_id}/reject"
+    )
+    def reject_agent_review(
+        evaluation_id: str,
+        review_id: str,
+    ) -> dict[str, Any]:
+        review = database.get_agent_review(evaluation_id, review_id)
+        if not review:
+            raise HTTPException(status_code=404, detail="Agent review not found")
+        if review["status"] != "ready" or not review["run_id"]:
+            raise HTTPException(
+                status_code=409,
+                detail="Agent review is not ready for rejection",
+            )
+        try:
+            _write_run_decision(
+                ai_vision_run_dir,
+                review["run_id"],
+                evaluation_id,
+                "rejected",
+            )
+            database.update_agent_review(review_id, status="rejected")
+            finish_agent_job_if_decided(evaluation_id)
+            return {
+                "status": "rejected",
+                "agent": {
+                    "enabled": True,
+                    **(database.get_agent_job_for_evaluation(evaluation_id) or {}),
+                },
+            }
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/evaluations/{evaluation_id}/questions/{question_id}/next")
     def next_question(evaluation_id: str, question_id: str) -> dict[str, Any]:

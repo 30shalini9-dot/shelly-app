@@ -1,33 +1,76 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "../api";
 import type { EvaluationListItem } from "../types";
 
 interface DashboardProps {
   onOpenEvaluation: (id: string) => void;
+  notice?: string;
 }
 
-export function Dashboard({ onOpenEvaluation }: DashboardProps) {
+export function Dashboard({ notice, onOpenEvaluation }: DashboardProps) {
   const [evaluations, setEvaluations] = useState<EvaluationListItem[]>([]);
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
+  const syncExtractingAgentJobs = useCallback(
+    async (items: EvaluationListItem[]) => {
+      const extracting = items.filter(
+        (item) => item.agent_mode && item.agent_status === "extracting",
+      );
+      if (extracting.length === 0) return false;
+      await Promise.all(
+        extracting.map((item) =>
+          api(`/evaluations/${item.evaluation_id}/agent/sync`, {
+            method: "POST",
+          }).catch(() => undefined),
+        ),
+      );
+      return true;
+    },
+    [],
+  );
+
+  const loadEvaluations = useCallback(async (shouldApply: () => boolean = () => true) => {
+    try {
+      let items = await api<EvaluationListItem[]>("/evaluations");
+      if (await syncExtractingAgentJobs(items)) {
+        items = await api<EvaluationListItem[]>("/evaluations");
+      }
+      if (!shouldApply()) return;
+      setEvaluations(items);
+      setError("");
+    } catch (requestError) {
+      if (!shouldApply()) return;
+      setError(
+        requestError instanceof Error
+          ? requestError.message
+          : "Unable to load evaluations",
+      );
+    } finally {
+      if (!shouldApply()) return;
+      setLoading(false);
+    }
+  }, [syncExtractingAgentJobs]);
+
   useEffect(() => {
-    let cancelled = false;
-    api<EvaluationListItem[]>("/evaluations")
-      .then((items) => {
-        if (!cancelled) setEvaluations(items);
-      })
-      .catch((requestError: Error) => {
-        if (!cancelled) setError(requestError.message);
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
+    let active = true;
+    void loadEvaluations(() => active);
     return () => {
-      cancelled = true;
+      active = false;
     };
-  }, []);
+  }, [loadEvaluations]);
+
+  useEffect(() => {
+    const hasActiveAgentJob = evaluations.some(
+      (item) =>
+        item.agent_mode &&
+        ["queued", "extracting", "evaluating"].includes(item.agent_status || ""),
+    );
+    if (!hasActiveAgentJob) return undefined;
+    const timer = window.setInterval(() => void loadEvaluations(), 2500);
+    return () => window.clearInterval(timer);
+  }, [evaluations, loadEvaluations]);
 
   const filtered = useMemo(() => {
     const normalized = query.toLowerCase().trim();
@@ -79,6 +122,8 @@ export function Dashboard({ onOpenEvaluation }: DashboardProps) {
         </div>
       </section>
 
+      {notice && <div className="dashboard-notice">{notice}</div>}
+
       <section className="surface table-surface">
         <div className="surface-toolbar">
           <div>
@@ -108,6 +153,7 @@ export function Dashboard({ onOpenEvaluation }: DashboardProps) {
                   <th>Paper code</th>
                   <th>Questions</th>
                   <th>Status</th>
+                  <th>Agent</th>
                   <th>Marks</th>
                   <th>Last updated</th>
                   <th />
@@ -133,6 +179,28 @@ export function Dashboard({ onOpenEvaluation }: DashboardProps) {
                       >
                         {evaluation.status}
                       </span>
+                    </td>
+                    <td>
+                      {evaluation.agent_mode ? (
+                        <span
+                          className={`agent-status agent-status-${
+                            evaluation.agent_status || "queued"
+                          }`}
+                        >
+                          <span aria-hidden="true" />
+                          {evaluation.agent_status === "ready"
+                            ? "Review ready"
+                            : evaluation.agent_status === "completed"
+                              ? "Reviewed"
+                              : evaluation.agent_status === "ignored"
+                                ? "Skipped"
+                                : evaluation.agent_status === "failed"
+                                  ? "Needs attention"
+                                  : evaluation.agent_status || "Queued"}
+                        </span>
+                      ) : (
+                        <span className="muted">Manual</span>
+                      )}
                     </td>
                     <td>
                       <strong>{evaluation.marks_awarded}</strong>
