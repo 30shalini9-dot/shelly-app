@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Iterator
 
-from .config import DATABASE_PATH, UPLOAD_DIR
+from .config import AGENT_JOB_RUN_DIR, DATABASE_PATH, UPLOAD_DIR
 
 
 SCHEMA = """
@@ -161,6 +162,7 @@ CREATE TABLE IF NOT EXISTS agent_question_reviews (
     cornerstone_question_no INTEGER NOT NULL,
     area_count INTEGER NOT NULL DEFAULT 0,
     area_urls_json TEXT NOT NULL DEFAULT '[]',
+    areas_json TEXT NOT NULL DEFAULT '[]',
     enhanced_image_url TEXT,
     bbox_json TEXT,
     run_id TEXT,
@@ -250,6 +252,17 @@ def initialize_database() -> None:
             conn.execute(
                 "ALTER TABLE agent_jobs ADD COLUMN cornerstone_status_url TEXT"
             )
+        agent_review_columns = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(agent_question_reviews)"
+            ).fetchall()
+        }
+        if "areas_json" not in agent_review_columns:
+            conn.execute(
+                "ALTER TABLE agent_question_reviews "
+                "ADD COLUMN areas_json TEXT NOT NULL DEFAULT '[]'"
+            )
         page_columns = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(submission_pages)").fetchall()
@@ -278,6 +291,7 @@ def initialize_database() -> None:
             """,
             (now_iso(),),
         )
+        _backfill_agent_review_areas(conn)
 
 
 def reset_database() -> None:
@@ -813,9 +827,16 @@ def get_agent_job_for_evaluation(evaluation_id: str) -> dict[str, Any] | None:
             **{
                 key: row[key]
                 for key in row.keys()
-                if key not in {"area_urls_json", "bbox_json", "marks_json"}
+                if key
+                not in {
+                    "area_urls_json",
+                    "areas_json",
+                    "bbox_json",
+                    "marks_json",
+                }
             },
             "area_urls": json.loads(row["area_urls_json"] or "[]"),
+            "areas": json.loads(row["areas_json"] or "[]"),
             "bbox": json.loads(row["bbox_json"]) if row["bbox_json"] else None,
             "marks": json.loads(row["marks_json"]) if row["marks_json"] else None,
         }
@@ -980,6 +1001,221 @@ def _normalized_area_bbox(area: dict[str, Any]) -> dict[str, float]:
     return {"x": x1, "y": y1, "w": width, "h": height}
 
 
+def _normalized_area_extent(area: dict[str, Any]) -> dict[str, float]:
+    bbox = area.get("bbox") if isinstance(area.get("bbox"), dict) else {}
+    normalized = (
+        bbox.get("normalized")
+        if isinstance(bbox.get("normalized"), dict)
+        else {}
+    )
+    x1 = _safe_float(normalized.get("x1"), 0)
+    y1 = _safe_float(normalized.get("y1"), 0)
+    x2 = _safe_float(normalized.get("x2"), x1)
+    y2 = _safe_float(normalized.get("y2"), y1)
+    width = _safe_float(normalized.get("width"), max(0, x2 - x1))
+    height = _safe_float(normalized.get("height"), max(0, y2 - y1))
+
+    if width <= 0:
+        width = 1
+    if height <= 0:
+        height = 1
+    x1 = min(1, max(0, x1))
+    width = min(1 - x1, max(0, width))
+    return {"x": x1, "y": y1, "w": width, "h": height}
+
+
+def _safe_page_index(value: Any, default: int | None) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _area_page_offset(areas: list[dict[str, Any]], pages: dict[int, str]) -> int:
+    page_indices = [
+        page_index
+        for area in areas
+        if (page_index := _safe_page_index(area.get("page_index"), None))
+        is not None
+    ]
+    if not page_indices:
+        return 0
+    return 1 if min(page_indices) == 0 and 0 not in pages else 0
+
+
+def _stored_cornerstone_questions(agent_job_id: str) -> list[dict[str, Any]]:
+    job_dir = AGENT_JOB_RUN_DIR / agent_job_id
+    candidates = [job_dir / "latest.json"]
+    if job_dir.exists():
+        candidates.extend(sorted(job_dir.glob("*-cornerstone-webhook.json"), reverse=True))
+        candidates.extend(sorted(job_dir.glob("*-cornerstone-sync.json"), reverse=True))
+
+    seen: set[str] = set()
+    for path in candidates:
+        path_key = str(path)
+        if path_key in seen or not path.exists():
+            continue
+        seen.add(path_key)
+        try:
+            stored = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        payload = stored.get("payload") if isinstance(stored, dict) else None
+        data = payload.get("data") if isinstance(payload, dict) else None
+        questions = data.get("questions") if isinstance(data, dict) else None
+        if isinstance(questions, list):
+            return [question for question in questions if isinstance(question, dict)]
+    return []
+
+
+def _cornerstone_question_for_review(
+    questions: list[dict[str, Any]],
+    question_order: int,
+    cornerstone_question_no: int,
+) -> dict[str, Any] | None:
+    index = question_order - 1
+    if 0 <= index < len(questions):
+        return questions[index]
+    for question in questions:
+        if _safe_page_index(question.get("question_no"), None) == cornerstone_question_no:
+            return question
+    return None
+
+
+def _backfill_agent_review_areas(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """
+        SELECT id, agent_job_id, evaluation_id, question_order,
+               cornerstone_question_no, page_id, areas_json
+        FROM agent_question_reviews
+        WHERE area_count > 0
+          AND (areas_json IS NULL OR areas_json = '' OR areas_json = '[]')
+        ORDER BY agent_job_id, question_order
+        """
+    ).fetchall()
+    if not rows:
+        return
+
+    pages_by_evaluation: dict[
+        str,
+        tuple[dict[int, str], dict[str, int]],
+    ] = {}
+    questions_by_agent_job: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        evaluation_id = row["evaluation_id"]
+        if evaluation_id not in pages_by_evaluation:
+            page_rows = conn.execute(
+                """
+                SELECT sp.id AS page_id, sp.page_number
+                FROM evaluations e
+                JOIN submission_pages sp ON sp.submission_id = e.submission_id
+                WHERE e.id = ?
+                ORDER BY sp.page_number
+                """,
+                (evaluation_id,),
+            ).fetchall()
+            pages = {page["page_number"]: page["page_id"] for page in page_rows}
+            page_numbers = {
+                page["page_id"]: page["page_number"] for page in page_rows
+            }
+            pages_by_evaluation[evaluation_id] = (pages, page_numbers)
+
+        agent_job_id = row["agent_job_id"]
+        if agent_job_id not in questions_by_agent_job:
+            questions_by_agent_job[agent_job_id] = _stored_cornerstone_questions(
+                agent_job_id
+            )
+        detected = _cornerstone_question_for_review(
+            questions_by_agent_job[agent_job_id],
+            row["question_order"],
+            row["cornerstone_question_no"],
+        )
+        areas = detected.get("areas") if isinstance(detected, dict) else None
+        if not isinstance(areas, list):
+            continue
+        areas = [area for area in areas if isinstance(area, dict)]
+        pages, page_numbers = pages_by_evaluation[evaluation_id]
+        geometries = _agent_area_geometries(areas, pages, page_numbers, row["page_id"])
+        if not geometries:
+            continue
+        conn.execute(
+            """
+            UPDATE agent_question_reviews
+            SET areas_json = ?
+            WHERE id = ?
+            """,
+            (json.dumps(geometries), row["id"]),
+        )
+
+
+def _agent_area_geometries(
+    areas: list[dict[str, Any]],
+    pages: dict[int, str],
+    page_numbers_by_id: dict[str, int],
+    fallback_page_id: str | None,
+) -> list[dict[str, Any]]:
+    fallback_page_number = (
+        page_numbers_by_id.get(fallback_page_id)
+        if fallback_page_id is not None
+        else None
+    )
+    geometries: list[dict[str, Any]] = []
+    page_index_offset = _area_page_offset(areas, pages)
+    for area_index, area in enumerate(areas, start=1):
+        raw_page_number = _safe_page_index(area.get("page_index"), None)
+        page_number = (
+            raw_page_number + page_index_offset
+            if raw_page_number is not None
+            else fallback_page_number
+        )
+        page_id = pages.get(page_number) if page_number is not None else None
+        if page_id is None:
+            page_id = fallback_page_id
+            page_number = fallback_page_number
+        if page_id is None or page_number is None:
+            continue
+
+        extent = _normalized_area_extent(area)
+        start_y = max(0.0, extent["y"])
+        end_y = max(start_y, extent["y"] + extent["h"])
+        first_offset = max(0, math.floor(start_y))
+        last_offset = max(first_offset, math.ceil(end_y) - 1)
+        for page_offset in range(first_offset, last_offset + 1):
+            segment_page_number = page_number + page_offset
+            segment_page_id = pages.get(segment_page_number)
+            if segment_page_id is None:
+                if page_offset == 0:
+                    segment_page_id = page_id
+                else:
+                    continue
+            segment_y = max(0.0, start_y - page_offset)
+            segment_bottom = min(1.0, end_y - page_offset)
+            segment_height = segment_bottom - segment_y
+            if segment_height <= 0:
+                continue
+            geometries.append(
+                {
+                    "area_index": area_index,
+                    "page_id": segment_page_id,
+                    "page_number": segment_page_number,
+                    "bbox": {
+                        "x": extent["x"],
+                        "y": segment_y,
+                        "w": extent["w"],
+                        "h": min(1 - segment_y, segment_height),
+                    },
+                }
+            )
+    return sorted(
+        geometries,
+        key=lambda item: (
+            item["page_number"] or 0,
+            item["bbox"]["y"] if item.get("bbox") else 0,
+            item["area_index"],
+        ),
+    )
+
+
 def prepare_agent_reviews(
     agent_job_id: str,
     cornerstone_questions: list[dict[str, Any]],
@@ -1010,6 +1246,7 @@ def prepare_agent_reviews(
             (job["evaluation_id"],),
         ).fetchall()
         pages = {row["page_number"]: row["page_id"] for row in page_rows}
+        page_numbers_by_id = {row["page_id"]: row["page_number"] for row in page_rows}
         first_page_id = page_rows[0]["page_id"] if page_rows else None
         mapped_pages = {
             row["question_id"]: row["page_id"]
@@ -1043,6 +1280,12 @@ def prepare_agent_reviews(
                 or first_page_id
             )
             bbox = _normalized_area_bbox(first_area)
+            area_geometries = _agent_area_geometries(
+                areas,
+                pages,
+                page_numbers_by_id,
+                page_id,
+            )
             area_urls = [
                 str(area["question_image_url"])
                 for area in areas
@@ -1061,9 +1304,9 @@ def prepare_agent_reviews(
                 INSERT INTO agent_question_reviews (
                     id, agent_job_id, evaluation_id, question_id, page_id,
                     question_order, cornerstone_question_no, area_count,
-                    area_urls_json, enhanced_image_url, bbox_json, max_marks,
+                    area_urls_json, areas_json, enhanced_image_url, bbox_json, max_marks,
                     status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
                 """,
                 (
                     review_id,
@@ -1075,6 +1318,7 @@ def prepare_agent_reviews(
                     cornerstone_question_no,
                     len(areas),
                     json.dumps(area_urls),
+                    json.dumps(area_geometries),
                     area_urls[0] if area_urls else None,
                     json.dumps(bbox),
                     question["max_marks"],

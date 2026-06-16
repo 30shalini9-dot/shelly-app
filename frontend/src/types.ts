@@ -162,6 +162,12 @@ export interface AgentReview {
   cornerstone_question_no: number;
   area_count: number;
   area_urls: string[];
+  areas?: Array<{
+    area_index: number;
+    page_id: string | null;
+    page_number: number | null;
+    bbox: { x: number; y: number; w: number; h: number } | null;
+  }>;
   enhanced_image_url: string | null;
   bbox: { x: number; y: number; w: number; h: number } | null;
   run_id: string | null;

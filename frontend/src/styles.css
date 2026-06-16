@@ -2044,9 +2044,10 @@ td > small {
   z-index: 18;
   box-sizing: border-box;
   display: grid;
-  width: min(clamp(218px, 30%, 292px), calc(100% - 16px));
+  width: min(clamp(260px, 36%, 360px), calc(100% - 16px));
   max-height: calc(100% - 16px);
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   gap: 8px;
   border: 1px solid color-mix(in srgb, var(--agent-review-color) 72%, white);
   border-top: 4px solid var(--agent-review-color);
@@ -2065,8 +2066,7 @@ td > small {
 }
 
 .agent-canvas-card-heading,
-.agent-canvas-card-total,
-.agent-canvas-card-steps > span {
+.agent-canvas-card-total {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -2107,38 +2107,45 @@ td > small {
 }
 
 .agent-canvas-card-steps > span {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 9px;
   min-height: 24px;
   border-top: 1px solid #eceff3;
   padding-top: 5px;
 }
 
 .agent-canvas-card-steps small {
-  overflow: hidden;
   min-width: 0;
   color: #3d5268;
   font-size: 0.64rem;
   font-weight: 700;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .agent-canvas-card-steps strong {
   color: var(--navy);
   font-size: 0.66rem;
+  white-space: nowrap;
 }
 
 .agent-canvas-card-actions {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) minmax(72px, auto);
   gap: 7px;
 }
 
 .agent-canvas-card-actions button {
+  min-width: 0;
   min-height: 34px;
   border-radius: 7px;
   padding: 7px 9px;
   font-size: 0.66rem;
   font-weight: 900;
+  white-space: nowrap;
 }
 
 .agent-canvas-card-actions .agent-accept {

@@ -115,9 +115,34 @@ interface AgentCardSize {
   h: number;
 }
 
+interface AgentReviewBox {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+interface AgentReviewAreaPlacement {
+  review: AgentReview;
+  hue: number;
+  pageId: string;
+  box: AgentReviewBox;
+  areaIndex: number;
+  areaCount: number;
+  isFinal: boolean;
+}
+
+interface AgentReviewArea {
+  pageId: string;
+  pageNumber: number | null;
+  areaIndex: number;
+  box: AgentReviewBox;
+}
+
 interface AgentCardPlacement {
   review: AgentReview;
   hue: number;
+  anchorBox: AgentReviewBox | null;
   position: AgentCardPosition;
   isStored: boolean;
 }
@@ -128,8 +153,8 @@ const LEGACY_TOTAL_ANNOTATION_PREFIX = "TOTAL:";
 const activeAgentStatuses = new Set(["queued", "extracting", "evaluating", "ignored"]);
 const syncableAgentStatuses = new Set(["extracting", "ignored"]);
 const AGENT_COLOR_STEP = 137.508;
-const AGENT_CARD_WIDTH_RATIO = 0.32;
-const AGENT_CARD_HEIGHT_RATIO = 0.18;
+const AGENT_CARD_WIDTH_RATIO = 0.36;
+const AGENT_CARD_HEIGHT_RATIO = 0.22;
 const AGENT_CARD_GAP = 0.014;
 
 function formatMark(value: number) {
@@ -188,15 +213,85 @@ function overlapsAgentCard(
   );
 }
 
-function automaticAgentCardPosition(
+function normalizeAgentReviewBox(
+  box: { x: number; y: number; w: number; h: number } | null | undefined,
+): AgentReviewBox | null {
+  if (
+    !box ||
+    !Number.isFinite(box.x) ||
+    !Number.isFinite(box.y) ||
+    !Number.isFinite(box.w) ||
+    !Number.isFinite(box.h)
+  ) {
+    return null;
+  }
+  const x = Math.min(1, Math.max(0, box.x));
+  const y = Math.min(1, Math.max(0, box.y));
+  const w = Math.min(1 - x, Math.max(0, box.w));
+  const h = Math.min(1 - y, Math.max(0, box.h));
+  if (w <= 0 || h <= 0) return null;
+  return { x, y, w, h };
+}
+
+function agentReviewAreas(review: AgentReview): AgentReviewArea[] {
+  const explicitAreas = Array.isArray(review.areas)
+    ? review.areas
+        .map((area, index) => {
+          const box = normalizeAgentReviewBox(area.bbox);
+          if (!area.page_id || !box) return null;
+          return {
+            pageId: area.page_id,
+            pageNumber: area.page_number,
+            areaIndex: area.area_index || index + 1,
+            box,
+          };
+        })
+        .filter((area): area is AgentReviewArea => Boolean(area))
+    : [];
+  if (explicitAreas.length > 0) return explicitAreas;
+
+  const fallbackBox = normalizeAgentReviewBox(review.bbox);
+  if (!review.page_id || !fallbackBox) return [];
+  return [
+    {
+      pageId: review.page_id,
+      pageNumber: null,
+      areaIndex: 1,
+      box: fallbackBox,
+    },
+  ];
+}
+
+function agentReviewAreasForPage(
   review: AgentReview,
+  pageId: string,
+  fallbackIndex: number,
+): AgentReviewAreaPlacement[] {
+  const areas = agentReviewAreas(review);
+  const finalArea = areas[areas.length - 1];
+  const hue = agentReviewHue(review, fallbackIndex);
+  return areas
+    .map((area, index) => ({
+      review,
+      hue,
+      pageId: area.pageId,
+      box: area.box,
+      areaIndex: area.areaIndex || index + 1,
+      areaCount: areas.length,
+      isFinal: area === finalArea,
+    }))
+    .filter((area) => area.pageId === pageId);
+}
+
+function automaticAgentCardPosition(
+  anchorBox: AgentReviewBox | null,
   occupied: Array<{ x: number; y: number; w: number; h: number }>,
   size: AgentCardSize = {
     w: AGENT_CARD_WIDTH_RATIO,
     h: AGENT_CARD_HEIGHT_RATIO,
   },
 ) {
-  const box = review.bbox;
+  const box = anchorBox;
   const cardSize = {
     w: Math.min(
       1,
@@ -259,14 +354,18 @@ function automaticAgentCardPosition(
 function placeAgentCards(
   reviews: AgentReview[],
   storedPositions: Record<string, AgentCardStoredPosition>,
+  pageId: string,
 ) {
   const occupied: Array<{ x: number; y: number; w: number; h: number }> = [];
-  return reviews.map((review, index) => {
+  return reviews.flatMap((review, index) => {
+    const areas = agentReviewAreas(review);
+    const anchorArea = areas[areas.length - 1];
+    if (!anchorArea || anchorArea.pageId !== pageId) return [];
     const storedPosition = storedPositions[review.id];
     const isStored = Boolean(storedPosition?.pinned);
     const position = storedPosition
       ? clampAgentCardPosition(storedPosition)
-      : automaticAgentCardPosition(review, occupied);
+      : automaticAgentCardPosition(anchorArea.box, occupied);
     occupied.push({
       ...position,
       w: AGENT_CARD_WIDTH_RATIO,
@@ -275,6 +374,7 @@ function placeAgentCards(
     return {
       review,
       hue: agentReviewHue(review, index),
+      anchorBox: anchorArea.box,
       position,
       isStored,
     };
@@ -917,7 +1017,7 @@ function AgentCanvasCard({
   onDragStart,
   onPositionClamp,
 }: AgentCanvasCardProps) {
-  const { review, hue, position, isStored } = placement;
+  const { review, hue, anchorBox, position, isStored } = placement;
   const marks = review.marks || [];
   const cardRef = useRef<HTMLElement | null>(null);
 
@@ -941,7 +1041,7 @@ function AgentCanvasCard({
       const cardSize = agentCardSizeFromElements(cardElement, pageElement);
       const clamped = isStored
         ? clampAgentCardPosition(position, cardSize)
-        : automaticAgentCardPosition(review, [], cardSize);
+        : automaticAgentCardPosition(anchorBox, [], cardSize);
       if (
         Math.abs(clamped.x - position.x) > 0.001 ||
         Math.abs(clamped.y - position.y) > 0.001
@@ -980,6 +1080,7 @@ function AgentCanvasCard({
     position,
     questionDetail?.question_id,
     questionDetail?.steps?.length,
+    anchorBox,
     review,
   ]);
 
@@ -1508,8 +1609,7 @@ export function EvaluationWorkspace({
         .filter(
           (review) =>
             review.status === "ready" &&
-            Boolean(review.page_id) &&
-            Boolean(review.bbox),
+            agentReviewAreas(review).length > 0,
         )
         .map((review) => [review.question_id, review]),
     );
@@ -2849,11 +2949,14 @@ export function EvaluationWorkspace({
                 pendingAiResult?.page_id === page.page_id
                   ? pendingAiResult
                   : null;
+              const agentReviewSegments = activeAgentReviews.flatMap(
+                (review, index) =>
+                  agentReviewAreasForPage(review, page.page_id, index),
+              );
               const agentCardPlacements = placeAgentCards(
-                activeAgentReview?.page_id === page.page_id
-                  ? [activeAgentReview]
-                  : [],
+                activeAgentReviews,
                 agentCardPositions,
+                page.page_id,
               );
               return (
                 <div className="answer-page-frame" key={page.page_id}>
@@ -2889,13 +2992,14 @@ export function EvaluationWorkspace({
                       draggable={false}
                       src={resolveImageUrl(page.image_url)}
                     />
-                    {agentCardPlacements.map(({ review, hue }) => {
-                      const box = review.bbox;
-                      if (!box) return null;
+                    {agentReviewSegments.map((segment) => {
+                      const { review, hue, box } = segment;
                       return (
                         <button
-                          className="agent-question-box"
-                          key={review.id}
+                          className={`agent-question-box ${
+                            segment.isFinal ? "final-segment" : ""
+                          }`}
+                          key={`${review.id}-${segment.areaIndex}-${page.page_id}`}
                           onClick={(event) => {
                             event.stopPropagation();
                             void selectQuestion(review.question_id);

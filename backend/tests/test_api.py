@@ -702,6 +702,172 @@ class ApiTestCase(unittest.TestCase):
             any(path.name.endswith("-cornerstone-sync.json") for path in artifact_dir.iterdir())
         )
 
+    def test_agent_review_returns_display_areas_across_page_boundary(self) -> None:
+        self.assertEqual(
+            self.client.post("/question-papers", json=PAPER).status_code,
+            201,
+        )
+        submission = self.client.post(
+            "/submissions",
+            data={
+                "student_id": "AGENT-MULTIPAGE",
+                "paper_code": "MATH-1-A",
+                "agent_mode": "true",
+            },
+            files=[
+                (
+                    "images",
+                    ("answer-1.png", b"original-page-1", "image/png"),
+                ),
+                (
+                    "images",
+                    ("answer-2.png", b"original-page-2", "image/png"),
+                ),
+            ],
+        ).json()
+        pages = self.client.get(
+            f"/evaluations/{submission['evaluation_id']}/pages"
+        ).json()
+
+        webhook = self._cornerstone_webhook(
+            {
+                "event": "cornerstone.job.done",
+                "job_id": "cornerstone-1",
+                "status": "done",
+                "data": {
+                    "question_count": 1,
+                    "questions": [
+                        {
+                            "question_no": 1,
+                            "areas": [
+                                {
+                                    "page_index": 1,
+                                    "question_image_url": (
+                                        "http://localhost:8001/v1/jobs/"
+                                        "cornerstone-1/questions/1/areas/1/image"
+                                        "?space=enhanced"
+                                    ),
+                                    "bbox": {
+                                        "normalized": {
+                                            "x1": 0.15,
+                                            "y1": 0.82,
+                                            "width": 0.5,
+                                            "height": 0.36,
+                                        }
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                },
+            }
+        )
+        self.assertEqual(webhook.status_code, 204)
+
+        agent = self.client.get(
+            f"/evaluations/{submission['evaluation_id']}/agent"
+        ).json()
+        review = agent["reviews"][0]
+        self.assertAlmostEqual(review["bbox"]["y"], 0.82)
+        self.assertAlmostEqual(review["bbox"]["h"], 0.18)
+        self.assertEqual(len(review["areas"]), 2)
+        self.assertEqual(review["areas"][0]["page_id"], pages[0]["page_id"])
+        self.assertEqual(review["areas"][1]["page_id"], pages[1]["page_id"])
+        self.assertAlmostEqual(review["areas"][0]["bbox"]["y"], 0.82)
+        self.assertAlmostEqual(review["areas"][0]["bbox"]["h"], 0.18)
+        self.assertAlmostEqual(review["areas"][1]["bbox"]["y"], 0)
+        self.assertAlmostEqual(review["areas"][1]["bbox"]["h"], 0.18)
+
+    def test_agent_review_returns_each_detected_area_across_pages(self) -> None:
+        self.assertEqual(
+            self.client.post("/question-papers", json=PAPER).status_code,
+            201,
+        )
+        submission = self.client.post(
+            "/submissions",
+            data={
+                "student_id": "AGENT-EXPLICIT-MULTIPAGE",
+                "paper_code": "MATH-1-A",
+                "agent_mode": "true",
+            },
+            files=[
+                (
+                    "images",
+                    ("answer-1.png", b"original-page-1", "image/png"),
+                ),
+                (
+                    "images",
+                    ("answer-2.png", b"original-page-2", "image/png"),
+                ),
+            ],
+        ).json()
+        pages = self.client.get(
+            f"/evaluations/{submission['evaluation_id']}/pages"
+        ).json()
+
+        webhook = self._cornerstone_webhook(
+            {
+                "event": "cornerstone.job.done",
+                "job_id": "cornerstone-1",
+                "status": "done",
+                "data": {
+                    "question_count": 1,
+                    "questions": [
+                        {
+                            "question_no": 1,
+                            "areas": [
+                                {
+                                    "page_index": 1,
+                                    "question_image_url": (
+                                        "http://localhost:8001/v1/jobs/"
+                                        "cornerstone-1/questions/1/areas/1/image"
+                                        "?space=enhanced"
+                                    ),
+                                    "bbox": {
+                                        "normalized": {
+                                            "x1": 0.1,
+                                            "y1": 0.72,
+                                            "width": 0.8,
+                                            "height": 0.28,
+                                        }
+                                    },
+                                },
+                                {
+                                    "page_index": 2,
+                                    "question_image_url": (
+                                        "http://localhost:8001/v1/jobs/"
+                                        "cornerstone-1/questions/1/areas/2/image"
+                                        "?space=enhanced"
+                                    ),
+                                    "bbox": {
+                                        "normalized": {
+                                            "x1": 0.12,
+                                            "y1": 0.0,
+                                            "width": 0.76,
+                                            "height": 0.24,
+                                        }
+                                    },
+                                },
+                            ],
+                        }
+                    ],
+                },
+            }
+        )
+        self.assertEqual(webhook.status_code, 204)
+
+        agent = self.client.get(
+            f"/evaluations/{submission['evaluation_id']}/agent"
+        ).json()
+        review = agent["reviews"][0]
+        self.assertEqual(len(review["areas"]), 2)
+        self.assertEqual(review["areas"][0]["page_id"], pages[0]["page_id"])
+        self.assertEqual(review["areas"][1]["page_id"], pages[1]["page_id"])
+        self.assertAlmostEqual(review["areas"][0]["bbox"]["y"], 0.72)
+        self.assertAlmostEqual(review["areas"][0]["bbox"]["h"], 0.28)
+        self.assertAlmostEqual(review["areas"][1]["bbox"]["y"], 0.0)
+        self.assertAlmostEqual(review["areas"][1]["bbox"]["h"], 0.24)
+
     def test_cornerstone_job_uses_ocr_enabled_mode(self) -> None:
         from app.agent_workflow import submit_cornerstone_job
 

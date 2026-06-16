@@ -546,6 +546,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        database.AGENT_JOB_RUN_DIR = agent_job_run_dir
         database.initialize_database()
         ai_vision_run_dir.mkdir(parents=True, exist_ok=True)
         agent_job_run_dir.mkdir(parents=True, exist_ok=True)
