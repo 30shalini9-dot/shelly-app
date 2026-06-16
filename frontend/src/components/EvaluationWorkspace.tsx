@@ -106,6 +106,10 @@ interface AgentCardPosition {
   y: number;
 }
 
+interface AgentCardStoredPosition extends AgentCardPosition {
+  pinned?: boolean;
+}
+
 interface AgentCardSize {
   w: number;
   h: number;
@@ -115,6 +119,7 @@ interface AgentCardPlacement {
   review: AgentReview;
   hue: number;
   position: AgentCardPosition;
+  isStored: boolean;
 }
 
 const TOTAL_ANNOTATION_PREFIX = "T|";
@@ -186,52 +191,81 @@ function overlapsAgentCard(
 function automaticAgentCardPosition(
   review: AgentReview,
   occupied: Array<{ x: number; y: number; w: number; h: number }>,
+  size: AgentCardSize = {
+    w: AGENT_CARD_WIDTH_RATIO,
+    h: AGENT_CARD_HEIGHT_RATIO,
+  },
 ) {
   const box = review.bbox;
-  const baseY = box?.y ?? 0.08;
+  const cardSize = {
+    w: Math.min(
+      1,
+      Math.max(0, Number.isFinite(size.w) ? size.w : AGENT_CARD_WIDTH_RATIO),
+    ),
+    h: Math.min(
+      1,
+      Math.max(0, Number.isFinite(size.h) ? size.h : AGENT_CARD_HEIGHT_RATIO),
+    ),
+  };
+  const centeredX = box
+    ? box.x + box.w / 2 - cardSize.w / 2
+    : 0.5 - cardSize.w / 2;
+  const belowY = box ? box.y + box.h + AGENT_CARD_GAP : 0.08;
+  const aboveY = box ? box.y - cardSize.h - AGENT_CARD_GAP : belowY;
+  const belowHasRoom = belowY + cardSize.h <= 1;
   const candidates: AgentCardPosition[] = box
-    ? [
-        { x: box.x + box.w + AGENT_CARD_GAP, y: box.y },
-        { x: box.x, y: box.y + box.h + AGENT_CARD_GAP },
-        { x: box.x - AGENT_CARD_WIDTH_RATIO - AGENT_CARD_GAP, y: box.y },
-        { x: box.x, y: box.y - AGENT_CARD_HEIGHT_RATIO - AGENT_CARD_GAP },
-        { x: 0.02, y: box.y },
-        { x: 0.98 - AGENT_CARD_WIDTH_RATIO, y: box.y },
-      ]
-    : [{ x: 0.62, y: baseY }];
+    ? belowHasRoom
+      ? [
+          { x: centeredX, y: belowY },
+          { x: centeredX, y: aboveY },
+        ]
+      : [
+          { x: centeredX, y: aboveY },
+          { x: centeredX, y: belowY },
+        ]
+    : [{ x: centeredX, y: belowY }];
 
   for (const candidate of candidates) {
-    let position = clampAgentCardPosition(candidate);
+    let position = clampAgentCardPosition(candidate, cardSize);
+    const verticalStep =
+      position.y < (box?.y ?? belowY)
+        ? -(cardSize.h + AGENT_CARD_GAP)
+        : cardSize.h + AGENT_CARD_GAP;
     for (let attempt = 0; attempt < 8; attempt += 1) {
       const cardBox = {
         ...position,
-        w: AGENT_CARD_WIDTH_RATIO,
-        h: AGENT_CARD_HEIGHT_RATIO,
+        w: cardSize.w,
+        h: cardSize.h,
       };
       if (!occupied.some((item) => overlapsAgentCard(cardBox, item))) {
         return position;
       }
       position = clampAgentCardPosition({
         x: position.x,
-        y: position.y + AGENT_CARD_HEIGHT_RATIO + AGENT_CARD_GAP,
-      });
+        y: position.y + verticalStep,
+      }, cardSize);
     }
   }
 
-  return clampAgentCardPosition({
-    x: box ? box.x + box.w + AGENT_CARD_GAP : 0.62,
-    y: baseY + occupied.length * (AGENT_CARD_HEIGHT_RATIO + AGENT_CARD_GAP),
-  });
+  return clampAgentCardPosition(
+    {
+      x: centeredX,
+      y: belowHasRoom ? belowY : aboveY,
+    },
+    cardSize,
+  );
 }
 
 function placeAgentCards(
   reviews: AgentReview[],
-  storedPositions: Record<string, AgentCardPosition>,
+  storedPositions: Record<string, AgentCardStoredPosition>,
 ) {
   const occupied: Array<{ x: number; y: number; w: number; h: number }> = [];
   return reviews.map((review, index) => {
-    const position = storedPositions[review.id]
-      ? clampAgentCardPosition(storedPositions[review.id])
+    const storedPosition = storedPositions[review.id];
+    const isStored = Boolean(storedPosition?.pinned);
+    const position = storedPosition
+      ? clampAgentCardPosition(storedPosition)
       : automaticAgentCardPosition(review, occupied);
     occupied.push({
       ...position,
@@ -242,6 +276,7 @@ function placeAgentCards(
       review,
       hue: agentReviewHue(review, index),
       position,
+      isStored,
     };
   });
 }
@@ -862,7 +897,11 @@ interface AgentCanvasCardProps {
     event: PointerEvent<HTMLElement>,
     review: AgentReview,
   ) => void;
-  onPositionClamp: (review: AgentReview, position: AgentCardPosition) => void;
+  onPositionClamp: (
+    review: AgentReview,
+    position: AgentCardPosition,
+    pinned: boolean,
+  ) => void;
 }
 
 function AgentCanvasCard({
@@ -878,7 +917,7 @@ function AgentCanvasCard({
   onDragStart,
   onPositionClamp,
 }: AgentCanvasCardProps) {
-  const { review, hue, position } = placement;
+  const { review, hue, position, isStored } = placement;
   const marks = review.marks || [];
   const cardRef = useRef<HTMLElement | null>(null);
 
@@ -887,25 +926,55 @@ function AgentCanvasCard({
     const pageElement = cardElement?.closest(".answer-page") as
       | HTMLElement
       | null;
-    if (
-      !cardElement ||
-      !pageElement ||
-      pageElement.clientWidth === 0 ||
-      pageElement.clientHeight === 0
-    ) {
-      return;
+    if (!cardElement || !pageElement) {
+      return undefined;
     }
-    const clamped = clampAgentCardPosition(
-      position,
-      agentCardSizeFromElements(cardElement, pageElement),
-    );
-    if (
-      Math.abs(clamped.x - position.x) > 0.001 ||
-      Math.abs(clamped.y - position.y) > 0.001
-    ) {
-      onPositionClamp(review, clamped);
-    }
+
+    let frameId: number | null = null;
+    const updatePosition = () => {
+      if (
+        pageElement.clientWidth === 0 ||
+        pageElement.clientHeight === 0
+      ) {
+        return;
+      }
+      const cardSize = agentCardSizeFromElements(cardElement, pageElement);
+      const clamped = isStored
+        ? clampAgentCardPosition(position, cardSize)
+        : automaticAgentCardPosition(review, [], cardSize);
+      if (
+        Math.abs(clamped.x - position.x) > 0.001 ||
+        Math.abs(clamped.y - position.y) > 0.001
+      ) {
+        onPositionClamp(review, clamped, isStored);
+      }
+    };
+    const scheduleUpdate = () => {
+      if (frameId !== null) {
+        window.cancelAnimationFrame(frameId);
+      }
+      frameId = window.requestAnimationFrame(() => {
+        frameId = null;
+        updatePosition();
+      });
+    };
+
+    updatePosition();
+    const observer =
+      typeof ResizeObserver === "undefined"
+        ? null
+        : new ResizeObserver(scheduleUpdate);
+    observer?.observe(cardElement);
+    observer?.observe(pageElement);
+
+    return () => {
+      if (frameId !== null) {
+        window.cancelAnimationFrame(frameId);
+      }
+      observer?.disconnect();
+    };
   }, [
+    isStored,
     marks.length,
     onPositionClamp,
     position,
@@ -1216,7 +1285,7 @@ export function EvaluationWorkspace({
   });
   const [agentDecisionId, setAgentDecisionId] = useState<string | null>(null);
   const [agentCardPositions, setAgentCardPositions] = useState<
-    Record<string, AgentCardPosition>
+    Record<string, AgentCardStoredPosition>
   >({});
   const [agentQuestionDetails, setAgentQuestionDetails] = useState<
     Record<string, Question>
@@ -2006,7 +2075,7 @@ export function EvaluationWorkspace({
     );
     setAgentCardPositions((current) => ({
       ...current,
-      [review.id]: measuredPosition,
+      [review.id]: { ...measuredPosition, pinned: true },
     }));
   };
 
@@ -2035,7 +2104,7 @@ export function EvaluationWorkspace({
     );
     setAgentCardPositions((current) => ({
       ...current,
-      [drag.reviewId]: next,
+      [drag.reviewId]: { ...next, pinned: true },
     }));
   };
 
@@ -2860,10 +2929,10 @@ export function EvaluationWorkspace({
                         onDragMove={moveAgentCardDrag}
                         onDragStart={beginAgentCardDrag}
                         onFocus={(review) => void selectQuestion(review.question_id)}
-                        onPositionClamp={(review, position) =>
+                        onPositionClamp={(review, position, pinned) =>
                           setAgentCardPositions((current) => ({
                             ...current,
-                            [review.id]: position,
+                            [review.id]: { ...position, pinned },
                           }))
                         }
                         onReject={(review) => void rejectAgentReview(review)}
@@ -3051,26 +3120,26 @@ export function EvaluationWorkspace({
         {question && (
           <>
             <section className="question-reference-summary">
-              <span>
-                <small>Question Number</small>
-                <strong>{question.question_no}</strong>
-              </span>
-              <span className="question-reference-text">
-                <small>Question text</small>
-                <strong>{question.question_text}</strong>
-              </span>
-              <span>
-                <small>Maximum Marks</small>
-                <strong>{formatMark(question.max_marks)} marks</strong>
-              </span>
-              <span>
-                <small>Total Steps</small>
-                <strong>{question.total_steps}</strong>
-              </span>
+              <h2 className="question-reference-title">
+                <span>{question.question_no}:</span>{" "}
+                {question.question_text || "Question text not provided."}
+              </h2>
+              <p className="question-reference-meta">
+                <span>
+                  Max Marks:{" "}
+                  <strong>{formatMark(question.max_marks)} marks</strong>
+                </span>
+                <span className="question-reference-divider" aria-hidden="true">
+                  |
+                </span>
+                <span>
+                  Total Steps: <strong>{question.total_steps}</strong>
+                </span>
+              </p>
             </section>
             <section className="marking-guide read-only-guide">
               <div className="section-heading-row">
-                <p className="panel-label">Step-wise information and marks</p>
+                <p className="panel-label">Step-wise Marking Details</p>
                 <span>
                   {question.marked_steps}/{question.total_steps}
                 </span>
