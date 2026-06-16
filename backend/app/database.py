@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS student_submissions (
     student_id TEXT NOT NULL,
     student_name TEXT,
     question_paper_id TEXT NOT NULL REFERENCES question_papers(id),
+    agent_mode INTEGER NOT NULL DEFAULT 0,
     evaluation_status TEXT NOT NULL DEFAULT 'Not Started',
     assigned_evaluator_id TEXT NOT NULL,
     evaluation_batch TEXT NOT NULL DEFAULT 'Default',
@@ -70,6 +71,9 @@ CREATE TABLE IF NOT EXISTS submission_pages (
     content_type TEXT NOT NULL,
     width INTEGER,
     height INTEGER,
+    enhanced_image_url TEXT,
+    enhanced_width INTEGER,
+    enhanced_height INTEGER,
     UNIQUE(submission_id, page_number)
 );
 
@@ -132,6 +136,44 @@ CREATE TABLE IF NOT EXISTS ai_vision_notes (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS agent_jobs (
+    id TEXT PRIMARY KEY,
+    evaluation_id TEXT NOT NULL UNIQUE REFERENCES evaluations(id) ON DELETE CASCADE,
+    cornerstone_job_id TEXT UNIQUE,
+    cornerstone_status_url TEXT,
+    status TEXT NOT NULL DEFAULT 'queued',
+    expected_questions INTEGER NOT NULL,
+    detected_questions INTEGER,
+    processed_questions INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS agent_question_reviews (
+    id TEXT PRIMARY KEY,
+    agent_job_id TEXT NOT NULL REFERENCES agent_jobs(id) ON DELETE CASCADE,
+    evaluation_id TEXT NOT NULL REFERENCES evaluations(id) ON DELETE CASCADE,
+    question_id TEXT NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+    page_id TEXT REFERENCES submission_pages(id) ON DELETE SET NULL,
+    question_order INTEGER NOT NULL,
+    cornerstone_question_no INTEGER NOT NULL,
+    area_count INTEGER NOT NULL DEFAULT 0,
+    area_urls_json TEXT NOT NULL DEFAULT '[]',
+    enhanced_image_url TEXT,
+    bbox_json TEXT,
+    run_id TEXT,
+    marks_json TEXT,
+    awarded_marks REAL,
+    max_marks REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(agent_job_id, question_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_questions_paper ON questions(question_paper_id);
 CREATE INDEX IF NOT EXISTS idx_steps_question ON question_steps(question_id);
 CREATE INDEX IF NOT EXISTS idx_pages_submission ON submission_pages(submission_id);
@@ -139,6 +181,8 @@ CREATE INDEX IF NOT EXISTS idx_marks_evaluation ON evaluation_step_marks(evaluat
 CREATE INDEX IF NOT EXISTS idx_annotations_evaluation ON answer_annotations(evaluation_id);
 CREATE INDEX IF NOT EXISTS idx_annotations_question ON answer_annotations(question_id);
 CREATE INDEX IF NOT EXISTS idx_ai_notes_evaluation ON ai_vision_notes(evaluation_id);
+CREATE INDEX IF NOT EXISTS idx_agent_reviews_job ON agent_question_reviews(agent_job_id);
+CREATE INDEX IF NOT EXISTS idx_agent_reviews_evaluation ON agent_question_reviews(evaluation_id);
 """
 
 
@@ -148,6 +192,20 @@ def now_iso() -> str:
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+def _safe_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value: Any) -> int | None:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -175,6 +233,51 @@ def initialize_database() -> None:
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     with connection() as conn:
         conn.executescript(SCHEMA)
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(student_submissions)").fetchall()
+        }
+        if "agent_mode" not in columns:
+            conn.execute(
+                "ALTER TABLE student_submissions "
+                "ADD COLUMN agent_mode INTEGER NOT NULL DEFAULT 0"
+            )
+        agent_job_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(agent_jobs)").fetchall()
+        }
+        if "cornerstone_status_url" not in agent_job_columns:
+            conn.execute(
+                "ALTER TABLE agent_jobs ADD COLUMN cornerstone_status_url TEXT"
+            )
+        page_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(submission_pages)").fetchall()
+        }
+        if "enhanced_image_url" not in page_columns:
+            conn.execute(
+                "ALTER TABLE submission_pages ADD COLUMN enhanced_image_url TEXT"
+            )
+        if "enhanced_width" not in page_columns:
+            conn.execute(
+                "ALTER TABLE submission_pages ADD COLUMN enhanced_width INTEGER"
+            )
+        if "enhanced_height" not in page_columns:
+            conn.execute(
+                "ALTER TABLE submission_pages ADD COLUMN enhanced_height INTEGER"
+            )
+        conn.execute(
+            """
+            UPDATE agent_jobs
+            SET status = 'extracting',
+                error = NULL,
+                completed_at = NULL,
+                updated_at = ?
+            WHERE status = 'ignored'
+              AND cornerstone_job_id IS NOT NULL
+            """,
+            (now_iso(),),
+        )
 
 
 def reset_database() -> None:
@@ -303,6 +406,7 @@ def create_submission(
     assigned_evaluator_id: str,
     evaluation_batch: str,
     pages: list[dict[str, Any]],
+    agent_mode: bool = False,
 ) -> dict[str, Any]:
     timestamp = now_iso()
     submission_id = new_id("sub")
@@ -320,15 +424,16 @@ def create_submission(
             """
             INSERT INTO student_submissions (
                 id, student_id, student_name, question_paper_id,
-                evaluation_status, assigned_evaluator_id, evaluation_batch,
+                agent_mode, evaluation_status, assigned_evaluator_id, evaluation_batch,
                 submitted_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'Not Started', ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, 'Not Started', ?, ?, ?, ?)
             """,
             (
                 submission_id,
                 student_id,
                 student_name,
                 paper["id"],
+                int(agent_mode),
                 assigned_evaluator_id,
                 evaluation_batch,
                 timestamp,
@@ -395,6 +500,22 @@ def create_submission(
                     "mapped" if mapped_page else "unmapped",
                 ),
             )
+        if agent_mode:
+            conn.execute(
+                """
+                INSERT INTO agent_jobs (
+                    id, evaluation_id, status, expected_questions,
+                    created_at, updated_at
+                ) VALUES (?, ?, 'queued', ?, ?, ?)
+                """,
+                (
+                    new_id("agent"),
+                    evaluation_id,
+                    len(questions),
+                    timestamp,
+                    timestamp,
+                ),
+            )
     return get_evaluation(evaluation_id)
 
 
@@ -414,16 +535,26 @@ def list_evaluations() -> list[dict[str, Any]]:
                 e.status,
                 e.updated_at,
                 p.maximum_marks,
+                s.agent_mode,
+                aj.status AS agent_status,
+                aj.processed_questions AS agent_processed_questions,
                 COALESCE(SUM(m.awarded_marks), 0) AS marks_awarded
             FROM evaluations e
             JOIN student_submissions s ON s.id = e.submission_id
             JOIN question_papers p ON p.id = s.question_paper_id
             LEFT JOIN evaluation_step_marks m ON m.evaluation_id = e.id
+            LEFT JOIN agent_jobs aj ON aj.evaluation_id = e.id
             GROUP BY e.id
             ORDER BY e.updated_at DESC
             """
         ).fetchall()
-    return [dict(row) for row in rows]
+    return [
+        {
+            **dict(row),
+            "agent_mode": bool(row["agent_mode"]),
+        }
+        for row in rows
+    ]
 
 
 def get_evaluation(evaluation_id: str) -> dict[str, Any] | None:
@@ -440,6 +571,7 @@ def get_evaluation(evaluation_id: str) -> dict[str, Any] | None:
                 s.id AS submission_id,
                 s.student_id,
                 s.student_name,
+                s.agent_mode,
                 s.evaluation_batch,
                 s.submitted_at,
                 p.id AS question_paper_id,
@@ -448,15 +580,17 @@ def get_evaluation(evaluation_id: str) -> dict[str, Any] | None:
                 p.subject_name,
                 p.class_code,
                 p.total_questions,
-                p.maximum_marks
+                p.maximum_marks,
+                aj.status AS agent_status
             FROM evaluations e
             JOIN student_submissions s ON s.id = e.submission_id
             JOIN question_papers p ON p.id = s.question_paper_id
+            LEFT JOIN agent_jobs aj ON aj.evaluation_id = e.id
             WHERE e.id = ?
             """,
             (evaluation_id,),
         ).fetchone()
-    return dict(row) if row else None
+    return {**dict(row), "agent_mode": bool(row["agent_mode"])} if row else None
 
 
 def get_pages(evaluation_id: str) -> list[dict[str, Any]] | None:
@@ -466,21 +600,49 @@ def get_pages(evaluation_id: str) -> list[dict[str, Any]] | None:
     with connection() as conn:
         rows = conn.execute(
             """
-            SELECT id AS page_id, page_number, original_filename, content_type,
-                   width, height
-            FROM submission_pages
-            WHERE submission_id = ?
-            ORDER BY page_number
+            SELECT
+                sp.id AS page_id,
+                sp.page_number,
+                sp.original_filename,
+                sp.content_type,
+                sp.width,
+                sp.height,
+                sp.enhanced_image_url,
+                sp.enhanced_width,
+                sp.enhanced_height,
+                s.agent_mode
+            FROM submission_pages sp
+            JOIN student_submissions s ON s.id = sp.submission_id
+            WHERE sp.submission_id = ?
+            ORDER BY sp.page_number
             """,
             (evaluation["submission_id"],),
         ).fetchall()
-    return [
-        {
-            **dict(row),
-            "image_url": f"/evaluations/{evaluation_id}/pages/{row['page_id']}/image",
+    pages: list[dict[str, Any]] = []
+    for row in rows:
+        local_image_url = f"/evaluations/{evaluation_id}/pages/{row['page_id']}/image"
+        use_enhanced = bool(row["agent_mode"] and row["enhanced_image_url"])
+        data = {
+            **{
+                key: row[key]
+                for key in row.keys()
+                if key
+                not in {
+                    "agent_mode",
+                    "enhanced_image_url",
+                    "enhanced_width",
+                    "enhanced_height",
+                }
+            },
+            "image_url": row["enhanced_image_url"] if use_enhanced else local_image_url,
+            "original_image_url": local_image_url,
+            "image_space": "enhanced" if use_enhanced else "original",
         }
-        for row in rows
-    ]
+        if use_enhanced:
+            data["width"] = row["enhanced_width"] or row["width"]
+            data["height"] = row["enhanced_height"] or row["height"]
+        pages.append(data)
+    return pages
 
 
 def get_page_file(evaluation_id: str, page_id: str) -> dict[str, Any] | None:
@@ -495,6 +657,487 @@ def get_page_file(evaluation_id: str, page_id: str) -> dict[str, Any] | None:
             (evaluation_id, page_id),
         ).fetchone()
     return dict(row) if row else None
+
+
+def get_agent_job_pages(agent_job_id: str) -> list[dict[str, Any]]:
+    with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT sp.id AS page_id, sp.page_number, sp.original_filename,
+                   sp.stored_path, sp.content_type
+            FROM agent_jobs aj
+            JOIN evaluations e ON e.id = aj.evaluation_id
+            JOIN submission_pages sp ON sp.submission_id = e.submission_id
+            WHERE aj.id = ?
+            ORDER BY sp.page_number
+            """,
+            (agent_job_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_agent_job_by_id(agent_job_id: str) -> dict[str, Any] | None:
+    with connection() as conn:
+        row = conn.execute(
+            """
+            SELECT aj.*, e.submission_id
+            FROM agent_jobs aj
+            JOIN evaluations e ON e.id = aj.evaluation_id
+            WHERE aj.id = ?
+            """,
+            (agent_job_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_agent_job_by_cornerstone_id(
+    cornerstone_job_id: str,
+) -> dict[str, Any] | None:
+    with connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM agent_jobs WHERE cornerstone_job_id = ?",
+            (cornerstone_job_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def ensure_agent_job(evaluation_id: str) -> dict[str, Any]:
+    timestamp = now_iso()
+    with connection() as conn:
+        evaluation = conn.execute(
+            """
+            SELECT e.id AS evaluation_id, e.submission_id, p.total_questions
+            FROM evaluations e
+            JOIN student_submissions s ON s.id = e.submission_id
+            JOIN question_papers p ON p.id = s.question_paper_id
+            WHERE e.id = ?
+            """,
+            (evaluation_id,),
+        ).fetchone()
+        if not evaluation:
+            raise LookupError("Evaluation was not found")
+        existing = conn.execute(
+            "SELECT * FROM agent_jobs WHERE evaluation_id = ?",
+            (evaluation_id,),
+        ).fetchone()
+        conn.execute(
+            "UPDATE student_submissions SET agent_mode = 1 WHERE id = ?",
+            (evaluation["submission_id"],),
+        )
+        if existing:
+            return dict(existing)
+        agent_job_id = new_id("agent")
+        conn.execute(
+            """
+            INSERT INTO agent_jobs (
+                id, evaluation_id, status, expected_questions,
+                created_at, updated_at
+            ) VALUES (?, ?, 'queued', ?, ?, ?)
+            """,
+            (
+                agent_job_id,
+                evaluation_id,
+                evaluation["total_questions"],
+                timestamp,
+                timestamp,
+            ),
+        )
+    job = get_agent_job_by_id(agent_job_id)
+    if not job:
+        raise LookupError("Agent job was not created")
+    return job
+
+
+def reset_agent_job_for_start(agent_job_id: str) -> None:
+    timestamp = now_iso()
+    with connection() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE agent_jobs
+            SET cornerstone_job_id = NULL,
+                cornerstone_status_url = NULL,
+                status = 'queued',
+                detected_questions = NULL,
+                processed_questions = 0,
+                error = NULL,
+                updated_at = ?,
+                completed_at = NULL
+            WHERE id = ?
+            """,
+            (timestamp, agent_job_id),
+        )
+        if cursor.rowcount == 0:
+            raise LookupError("Agent job was not found")
+        conn.execute(
+            "DELETE FROM agent_question_reviews WHERE agent_job_id = ?",
+            (agent_job_id,),
+        )
+        conn.execute(
+            """
+            UPDATE submission_pages
+            SET enhanced_image_url = NULL,
+                enhanced_width = NULL,
+                enhanced_height = NULL
+            WHERE submission_id = (
+                SELECT e.submission_id
+                FROM agent_jobs aj
+                JOIN evaluations e ON e.id = aj.evaluation_id
+                WHERE aj.id = ?
+            )
+            """,
+            (agent_job_id,),
+        )
+
+
+def get_agent_job_for_evaluation(evaluation_id: str) -> dict[str, Any] | None:
+    with connection() as conn:
+        job = conn.execute(
+            "SELECT * FROM agent_jobs WHERE evaluation_id = ?",
+            (evaluation_id,),
+        ).fetchone()
+        if not job:
+            return None
+        reviews = conn.execute(
+            """
+            SELECT aqr.*, q.question_no, q.question_text
+            FROM agent_question_reviews aqr
+            JOIN questions q ON q.id = aqr.question_id
+            WHERE aqr.agent_job_id = ?
+            ORDER BY aqr.question_order
+            """,
+            (job["id"],),
+        ).fetchall()
+    result = dict(job)
+    result["reviews"] = [
+        {
+            **{
+                key: row[key]
+                for key in row.keys()
+                if key not in {"area_urls_json", "bbox_json", "marks_json"}
+            },
+            "area_urls": json.loads(row["area_urls_json"] or "[]"),
+            "bbox": json.loads(row["bbox_json"]) if row["bbox_json"] else None,
+            "marks": json.loads(row["marks_json"]) if row["marks_json"] else None,
+        }
+        for row in reviews
+    ]
+    result["ready_questions"] = sum(
+        review["status"] == "ready" for review in result["reviews"]
+    )
+    result["accepted_questions"] = sum(
+        review["status"] == "accepted" for review in result["reviews"]
+    )
+    result["rejected_questions"] = sum(
+        review["status"] == "rejected" for review in result["reviews"]
+    )
+    return result
+
+
+def update_agent_job(
+    agent_job_id: str,
+    *,
+    status: str | None = None,
+    cornerstone_job_id: str | None = None,
+    cornerstone_status_url: str | None = None,
+    detected_questions: int | None = None,
+    processed_questions: int | None = None,
+    error: str | None = None,
+    completed: bool = False,
+    clear_error: bool = False,
+    clear_completed_at: bool = False,
+) -> None:
+    values: dict[str, Any] = {"updated_at": now_iso()}
+    if status is not None:
+        values["status"] = status
+    if cornerstone_job_id is not None:
+        values["cornerstone_job_id"] = cornerstone_job_id
+    if cornerstone_status_url is not None:
+        values["cornerstone_status_url"] = cornerstone_status_url
+    if detected_questions is not None:
+        values["detected_questions"] = detected_questions
+    if processed_questions is not None:
+        values["processed_questions"] = processed_questions
+    if error is not None:
+        values["error"] = error
+    elif clear_error:
+        values["error"] = None
+    if completed:
+        values["completed_at"] = now_iso()
+    elif clear_completed_at:
+        values["completed_at"] = None
+    assignments = ", ".join(f"{key} = ?" for key in values)
+    with connection() as conn:
+        cursor = conn.execute(
+            f"UPDATE agent_jobs SET {assignments} WHERE id = ?",
+            (*values.values(), agent_job_id),
+        )
+        if cursor.rowcount == 0:
+            raise LookupError("Agent job was not found")
+
+
+def update_agent_page_images(
+    evaluation_id: str,
+    cornerstone_pages: list[dict[str, Any]],
+    cornerstone_questions: list[dict[str, Any]] | None = None,
+) -> None:
+    page_updates: dict[int, dict[str, Any]] = {}
+
+    def add_page_update(page_index: Any, values: dict[str, Any]) -> None:
+        try:
+            page_number = int(page_index)
+        except (TypeError, ValueError):
+            return
+        if page_number <= 0:
+            return
+        image_url = values.get("image_url") or values.get("page_image_url")
+        if not image_url:
+            return
+        current = page_updates.setdefault(page_number, {})
+        current["image_url"] = str(image_url)
+        if values.get("width") is not None:
+            current["width"] = values.get("width")
+        if values.get("height") is not None:
+            current["height"] = values.get("height")
+
+    for page in cornerstone_pages:
+        if not isinstance(page, dict):
+            continue
+        add_page_update(page.get("page_index") or page.get("page_number"), page)
+
+    for question in cornerstone_questions or []:
+        if not isinstance(question, dict):
+            continue
+        for area in question.get("areas") or []:
+            if not isinstance(area, dict):
+                continue
+            add_page_update(
+                area.get("page_index") or area.get("page_number"),
+                {
+                    "page_image_url": area.get("page_image_url"),
+                },
+            )
+
+    if not page_updates:
+        return
+
+    with connection() as conn:
+        submission = conn.execute(
+            "SELECT submission_id FROM evaluations WHERE id = ?",
+            (evaluation_id,),
+        ).fetchone()
+        if not submission:
+            raise LookupError("Evaluation was not found")
+        timestamp = now_iso()
+        for page_number, values in page_updates.items():
+            conn.execute(
+                """
+                UPDATE submission_pages
+                SET enhanced_image_url = ?,
+                    enhanced_width = ?,
+                    enhanced_height = ?
+                WHERE submission_id = ? AND page_number = ?
+                """,
+                (
+                    values["image_url"],
+                    _safe_int(values.get("width")),
+                    _safe_int(values.get("height")),
+                    submission["submission_id"],
+                    page_number,
+                ),
+            )
+        conn.execute(
+            """
+            UPDATE student_submissions
+            SET updated_at = ?
+            WHERE id = ?
+            """,
+            (timestamp, submission["submission_id"]),
+        )
+
+
+def _normalized_area_bbox(area: dict[str, Any]) -> dict[str, float]:
+    bbox = area.get("bbox") if isinstance(area.get("bbox"), dict) else {}
+    normalized = (
+        bbox.get("normalized")
+        if isinstance(bbox.get("normalized"), dict)
+        else {}
+    )
+    x1 = _safe_float(normalized.get("x1"), 0)
+    y1 = _safe_float(normalized.get("y1"), 0)
+    x2 = _safe_float(normalized.get("x2"), x1)
+    y2 = _safe_float(normalized.get("y2"), y1)
+    width = _safe_float(normalized.get("width"), max(0, x2 - x1))
+    height = _safe_float(normalized.get("height"), max(0, y2 - y1))
+
+    if width <= 0:
+        width = 1
+    if height <= 0:
+        height = 1
+    x1 = min(1, max(0, x1))
+    y1 = min(1, max(0, y1))
+    width = min(1 - x1, max(0, width))
+    height = min(1 - y1, max(0, height))
+    return {"x": x1, "y": y1, "w": width, "h": height}
+
+
+def prepare_agent_reviews(
+    agent_job_id: str,
+    cornerstone_questions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    job = get_agent_job_by_id(agent_job_id)
+    if not job:
+        raise LookupError("Agent job was not found")
+    with connection() as conn:
+        questions = conn.execute(
+            """
+            SELECT q.id AS question_id, q.question_no, q.max_marks, q.display_order
+            FROM evaluations e
+            JOIN student_submissions s ON s.id = e.submission_id
+            JOIN questions q ON q.question_paper_id = s.question_paper_id
+            WHERE e.id = ?
+            ORDER BY q.display_order
+            """,
+            (job["evaluation_id"],),
+        ).fetchall()
+        page_rows = conn.execute(
+            """
+            SELECT sp.id AS page_id, sp.page_number
+            FROM evaluations e
+            JOIN submission_pages sp ON sp.submission_id = e.submission_id
+            WHERE e.id = ?
+            ORDER BY sp.page_number
+            """,
+            (job["evaluation_id"],),
+        ).fetchall()
+        pages = {row["page_number"]: row["page_id"] for row in page_rows}
+        first_page_id = page_rows[0]["page_id"] if page_rows else None
+        mapped_pages = {
+            row["question_id"]: row["page_id"]
+            for row in conn.execute(
+                """
+                SELECT question_id, page_id
+                FROM submission_question_mappings
+                WHERE submission_id = ?
+                """,
+                (job["submission_id"],),
+            ).fetchall()
+        }
+        conn.execute(
+            "DELETE FROM agent_question_reviews WHERE agent_job_id = ?",
+            (agent_job_id,),
+        )
+        timestamp = now_iso()
+        review_ids: list[str] = []
+        for question, detected in zip(questions, cornerstone_questions):
+            detected = detected if isinstance(detected, dict) else {}
+            areas = detected.get("areas") or []
+            areas = [area for area in areas if isinstance(area, dict)]
+            first_area = areas[0] if areas else {}
+            try:
+                page_index = int(first_area.get("page_index", 0))
+            except (TypeError, ValueError):
+                page_index = 0
+            page_id = (
+                pages.get(page_index)
+                or mapped_pages.get(question["question_id"])
+                or first_page_id
+            )
+            bbox = _normalized_area_bbox(first_area)
+            area_urls = [
+                str(area["question_image_url"])
+                for area in areas
+                if area.get("question_image_url")
+            ]
+            try:
+                cornerstone_question_no = int(
+                    detected.get("question_no", question["display_order"])
+                )
+            except (TypeError, ValueError):
+                cornerstone_question_no = question["display_order"]
+            review_id = new_id("review")
+            review_ids.append(review_id)
+            conn.execute(
+                """
+                INSERT INTO agent_question_reviews (
+                    id, agent_job_id, evaluation_id, question_id, page_id,
+                    question_order, cornerstone_question_no, area_count,
+                    area_urls_json, enhanced_image_url, bbox_json, max_marks,
+                    status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+                """,
+                (
+                    review_id,
+                    agent_job_id,
+                    job["evaluation_id"],
+                    question["question_id"],
+                    page_id,
+                    question["display_order"],
+                    cornerstone_question_no,
+                    len(areas),
+                    json.dumps(area_urls),
+                    area_urls[0] if area_urls else None,
+                    json.dumps(bbox),
+                    question["max_marks"],
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE submission_question_mappings
+                SET page_id = ?, bbox_json = ?, mapping_status = 'mapped'
+                WHERE submission_id = ? AND question_id = ?
+                """,
+                (
+                    page_id,
+                    json.dumps(bbox),
+                    job["submission_id"],
+                    question["question_id"],
+                ),
+            )
+    all_reviews = get_agent_job_for_evaluation(job["evaluation_id"])["reviews"]
+    return [review for review in all_reviews if review["id"] in review_ids]
+
+
+def update_agent_review(
+    review_id: str,
+    *,
+    status: str,
+    run_id: str | None = None,
+    marks: list[float] | None = None,
+    awarded_marks: float | None = None,
+    error: str | None = None,
+) -> None:
+    values: dict[str, Any] = {
+        "status": status,
+        "updated_at": now_iso(),
+    }
+    if run_id is not None:
+        values["run_id"] = run_id
+    if marks is not None:
+        values["marks_json"] = json.dumps(marks)
+    if awarded_marks is not None:
+        values["awarded_marks"] = awarded_marks
+    if error is not None:
+        values["error"] = error
+    assignments = ", ".join(f"{key} = ?" for key in values)
+    with connection() as conn:
+        cursor = conn.execute(
+            f"UPDATE agent_question_reviews SET {assignments} WHERE id = ?",
+            (*values.values(), review_id),
+        )
+        if cursor.rowcount == 0:
+            raise LookupError("Agent review was not found")
+
+
+def get_agent_review(
+    evaluation_id: str,
+    review_id: str,
+) -> dict[str, Any] | None:
+    job = get_agent_job_for_evaluation(evaluation_id)
+    if not job:
+        return None
+    return next((item for item in job["reviews"] if item["id"] == review_id), None)
 
 
 def _question_rows(conn: sqlite3.Connection, evaluation_id: str) -> list[sqlite3.Row]:

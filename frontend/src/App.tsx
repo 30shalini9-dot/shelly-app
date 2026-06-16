@@ -13,16 +13,24 @@ export function App() {
   );
   const [screen, setScreen] = useState<Screen>("dashboard");
   const [evaluationId, setEvaluationId] = useState<string | null>(null);
+  const [dashboardNotice, setDashboardNotice] = useState("");
 
   const openEvaluation = (id: string) => {
+    setDashboardNotice("");
     setEvaluationId(id);
     setScreen("evaluation");
+  };
+
+  const showDashboard = (notice = "") => {
+    setDashboardNotice(notice);
+    setScreen("dashboard");
   };
 
   const logout = async () => {
     await api("/auth/logout", { method: "POST" }).catch(() => undefined);
     localStorage.removeItem("sheldon-token");
     setAuthenticated(false);
+    setDashboardNotice("");
     setScreen("dashboard");
   };
 
@@ -41,7 +49,7 @@ export function App() {
     return (
       <EvaluationWorkspace
         evaluationId={evaluationId}
-        onBack={() => setScreen("dashboard")}
+        onBack={() => showDashboard()}
       />
     );
   }
@@ -51,7 +59,7 @@ export function App() {
       <header className="app-header">
         <button
           className="brand-lockup brand-button"
-          onClick={() => setScreen("dashboard")}
+          onClick={() => showDashboard()}
           type="button"
         >
           <span className="brand-mark">S</span>
@@ -63,14 +71,17 @@ export function App() {
         <nav className="header-nav" aria-label="Primary navigation">
           <button
             className={screen === "dashboard" ? "nav-active" : ""}
-            onClick={() => setScreen("dashboard")}
+            onClick={() => showDashboard()}
             type="button"
           >
             Evaluations
           </button>
           <button
             className={screen === "data" ? "nav-active" : ""}
-            onClick={() => setScreen("data")}
+            onClick={() => {
+              setDashboardNotice("");
+              setScreen("data");
+            }}
             type="button"
           >
             Add data
@@ -88,9 +99,12 @@ export function App() {
         </div>
       </header>
       {screen === "dashboard" ? (
-        <Dashboard onOpenEvaluation={openEvaluation} />
+        <Dashboard notice={dashboardNotice} onOpenEvaluation={openEvaluation} />
       ) : (
-        <DataManager onOpenEvaluation={openEvaluation} />
+        <DataManager
+          onOpenEvaluation={openEvaluation}
+          onShowDashboard={showDashboard}
+        />
       )}
     </div>
   );

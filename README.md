@@ -158,6 +158,13 @@ to uploaded pages in display order; mappings can later be changed through:
 POST /evaluations/{evaluation_id}/questions/{question_id}/change-mapping
 ```
 
+To run the automatic review workflow, enable **Check in agent mode** while
+uploading the submission. The backend creates a durable agent job, sends the
+uploaded pages to the local Cornerstone service, and prepares AI Vision
+proposals in question order. If Cornerstone returns fewer coordinate sets than
+the paper has questions, only those first questions get proposals and the rest
+remain manual. If Cornerstone returns extra coordinate sets, extras are ignored.
+
 ## Evaluation API
 
 Core endpoints:
@@ -181,6 +188,13 @@ PATCH /evaluations/{evaluation_id}/annotations/{annotation_id}
 POST  /evaluations/{evaluation_id}/ai-vision
 POST  /evaluations/{evaluation_id}/ai-vision/accept
 POST  /evaluations/{evaluation_id}/ai-vision/reject
+GET   /evaluations/{evaluation_id}/agent
+POST  /evaluations/{evaluation_id}/agent/start
+POST  /evaluations/{evaluation_id}/agent/sync
+POST  /evaluations/{evaluation_id}/agent/reviews/{review_id}/accept
+POST  /evaluations/{evaluation_id}/agent/reviews/{review_id}/reject
+POST  /agent-jobs/cornerstone/webhook
+POST  /api/cornerstone/webhook
 GET   /evaluations/{evaluation_id}/progress
 GET   /evaluations/{evaluation_id}/marks-summary
 POST  /evaluations/{evaluation_id}/submit
@@ -248,6 +262,51 @@ The folder contains the exact `answer-selection` image sent to Ollama,
 `context.txt`, request metadata, the raw model response, and normalized marks.
 Model rationale is retained internally for a future review feature but is
 intentionally hidden from the current UI.
+
+## Agent mode with Cornerstone
+
+Start the Cornerstone sidecar on `http://localhost:8001`, then start Sheldon.
+The backend submits `ocr_enabled=true`, `coordinate_space=enhanced`, and
+`image_delivery=url` jobs to Cornerstone. The webhook is signed with
+`SHELDON_CORNERSTONE_WEBHOOK_SECRET`.
+
+The app-facing flow is:
+
+```text
+POST /evaluations/{evaluation_id}/agent/start
+POST /evaluations/{evaluation_id}/agent/sync
+GET  /evaluations/{evaluation_id}/agent
+```
+
+`/agent/start` calls Cornerstone at `POST /v1/jobs`, reads the `202` JSON
+response, and stores both `job_id` and `status_url`. `/agent/sync` polls the
+stored `status_url` when the webhook has not populated local state yet. Do not
+call `/agent-jobs/cornerstone/webhook` from the frontend; it is only a receiver
+for Cornerstone and intentionally returns `204 No Content`.
+
+Useful settings:
+
+```bash
+export SHELDON_CORNERSTONE_API_URL=http://localhost:8001
+export SHELDON_PUBLIC_API_URL=http://localhost:8000
+export SHELDON_CORNERSTONE_WEBHOOK_SECRET=sheldon-local-agent
+export SHELDON_AGENT_DUMMY_FULL_MARKS=true
+export SHELDON_AGENT_JOB_RUN_DIR=data/agent_jobs
+```
+
+`SHELDON_AGENT_DUMMY_FULL_MARKS=true` keeps the agent workflow in test mode:
+it still sends pages to Cornerstone, stores the returned enhanced coordinates
+and answer segments, then creates full-mark proposals without calling the local
+vision model. Set it to `false` when you want real agent AI Vision evaluation.
+Cornerstone submit, webhook, and sync payloads are retained under
+`backend/data/agent_jobs/{agent_job_id}/` by default; set
+`SHELDON_AGENT_JOB_RUN_DIR` to use another location.
+
+When proposals are ready, the dashboard shows **Review ready** in the Agent
+column. In the evaluation workspace, each question shows an enhanced answer
+segment, proposed step marks, and **Accept & next** / **Reject** actions.
+Accepting applies marks atomically and creates the AI total label on the answer
+sheet; rejecting leaves marks unchanged.
 
 ## Tests and builds
 

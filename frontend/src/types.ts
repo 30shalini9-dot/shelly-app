@@ -13,6 +13,9 @@ export interface EvaluationListItem {
   updated_at: string;
   maximum_marks: number;
   marks_awarded: number;
+  agent_mode: boolean;
+  agent_status: AgentJobStatus | null;
+  agent_processed_questions: number | null;
 }
 
 export interface Evaluation {
@@ -28,6 +31,8 @@ export interface Evaluation {
   class_code: string;
   total_questions: number;
   maximum_marks: number;
+  agent_mode: boolean;
+  agent_status: AgentJobStatus | null;
 }
 
 export interface Page {
@@ -36,6 +41,10 @@ export interface Page {
   original_filename: string;
   content_type: string;
   image_url: string;
+  original_image_url?: string;
+  image_space?: "original" | "enhanced";
+  width?: number | null;
+  height?: number | null;
 }
 
 export interface Step {
@@ -124,4 +133,57 @@ export interface AiVisionResult {
 export interface AiVisionAcceptResponse {
   question: Question;
   annotation: Annotation;
+}
+
+export type AgentJobStatus =
+  | "queued"
+  | "extracting"
+  | "evaluating"
+  | "ready"
+  | "ignored"
+  | "failed"
+  | "completed";
+
+export type AgentReviewStatus =
+  | "queued"
+  | "evaluating"
+  | "ready"
+  | "accepted"
+  | "rejected"
+  | "error";
+
+export interface AgentReview {
+  id: string;
+  question_id: string;
+  question_no: string;
+  question_text: string;
+  page_id: string | null;
+  question_order: number;
+  cornerstone_question_no: number;
+  area_count: number;
+  area_urls: string[];
+  enhanced_image_url: string | null;
+  bbox: { x: number; y: number; w: number; h: number } | null;
+  run_id: string | null;
+  marks: number[] | null;
+  awarded_marks: number | null;
+  max_marks: number;
+  status: AgentReviewStatus;
+  error: string | null;
+}
+
+export interface AgentJob {
+  enabled: boolean;
+  id?: string;
+  cornerstone_job_id?: string | null;
+  cornerstone_status_url?: string | null;
+  status?: AgentJobStatus;
+  expected_questions?: number;
+  detected_questions?: number | null;
+  processed_questions?: number;
+  ready_questions?: number;
+  accepted_questions?: number;
+  rejected_questions?: number;
+  error?: string | null;
+  reviews: AgentReview[];
 }

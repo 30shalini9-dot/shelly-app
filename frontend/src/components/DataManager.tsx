@@ -4,6 +4,7 @@ import type { Evaluation, QuestionPaper } from "../types";
 
 interface DataManagerProps {
   onOpenEvaluation: (id: string) => void;
+  onShowDashboard: (message?: string) => void;
 }
 
 const samplePaper = {
@@ -45,7 +46,10 @@ const samplePaper = {
   ],
 };
 
-export function DataManager({ onOpenEvaluation }: DataManagerProps) {
+export function DataManager({
+  onOpenEvaluation,
+  onShowDashboard,
+}: DataManagerProps) {
   const [papers, setPapers] = useState<QuestionPaper[]>([]);
   const [paperJson, setPaperJson] = useState(
     JSON.stringify(samplePaper, null, 2),
@@ -93,16 +97,25 @@ export function DataManager({ onOpenEvaluation }: DataManagerProps) {
     setSubmissionMessage("");
     const form = event.currentTarget;
     const formData = new FormData(form);
+    const isAgentMode = formData.get("agent_mode") === "true";
+    let dashboardMessage = "";
+    let evaluationToOpen = "";
     try {
       const result = await api<Evaluation>("/submissions", {
         method: "POST",
         body: formData,
       });
-      setSubmissionMessage(
-        `Created submission for ${result.student_id}. Opening evaluation...`,
-      );
       form.reset();
-      onOpenEvaluation(result.evaluation_id);
+      if (isAgentMode) {
+        const message = `Agent is running for ${result.student_id}. Wait for it to finish or check manually from the dashboard.`;
+        setSubmissionMessage(message);
+        dashboardMessage = message;
+      } else {
+        setSubmissionMessage(
+          `Created submission for ${result.student_id}. Opening evaluation...`,
+        );
+        evaluationToOpen = result.evaluation_id;
+      }
     } catch (error) {
       setSubmissionMessage(
         error instanceof Error ? error.message : "Unable to upload submission",
@@ -110,6 +123,8 @@ export function DataManager({ onOpenEvaluation }: DataManagerProps) {
     } finally {
       setBusy(null);
     }
+    if (dashboardMessage) onShowDashboard(dashboardMessage);
+    if (evaluationToOpen) onOpenEvaluation(evaluationToOpen);
   };
 
   return (
@@ -206,6 +221,19 @@ export function DataManager({ onOpenEvaluation }: DataManagerProps) {
                   type="file"
                 />
                 <small>PNG, JPG, WebP, GIF or SVG · maximum 15 MB each</small>
+              </label>
+              <label className="agent-mode-toggle">
+                <input name="agent_mode" type="checkbox" value="true" />
+                <span className="agent-toggle-track" aria-hidden="true">
+                  <span />
+                </span>
+                <span className="agent-toggle-copy">
+                  <strong>Check in agent mode</strong>
+                  <small>
+                    Detect question areas with Cornerstone, then prepare AI
+                    marks for evaluator approval.
+                  </small>
+                </span>
               </label>
               {submissionMessage && (
                 <p className="form-message">{submissionMessage}</p>

@@ -10,6 +10,8 @@ import {
 } from "react";
 import { API_BASE, api } from "../api";
 import type {
+  AgentJob,
+  AgentReview,
   AiVisionAcceptResponse,
   AiVisionResult,
   Annotation,
@@ -57,6 +59,15 @@ interface AiResultCardProps {
   onReject: () => void;
 }
 
+interface AgentAcceptResponse extends AiVisionAcceptResponse {
+  agent: AgentJob;
+}
+
+interface AgentRejectResponse {
+  status: "rejected";
+  agent: AgentJob;
+}
+
 type DrawingTool = "pen" | "eraser" | "text";
 
 interface DrawingStroke {
@@ -92,6 +103,8 @@ interface QuestionTotalSummary {
 const TOTAL_ANNOTATION_PREFIX = "T|";
 const AI_TOTAL_ANNOTATION_PREFIX = "TAI|";
 const LEGACY_TOTAL_ANNOTATION_PREFIX = "TOTAL:";
+const activeAgentStatuses = new Set(["queued", "extracting", "evaluating", "ignored"]);
+const syncableAgentStatuses = new Set(["extracting", "ignored"]);
 
 function formatMark(value: number) {
   return Number.isInteger(value)
@@ -173,6 +186,11 @@ function loadExportImage(src: string) {
     image.crossOrigin = "anonymous";
     image.src = src;
   });
+}
+
+function resolveImageUrl(src: string) {
+  if (/^(https?:)?\/\//.test(src) || src.startsWith("data:")) return src;
+  return `${API_BASE}${src}`;
 }
 
 function canvasToJpegBytes(canvas: HTMLCanvasElement) {
@@ -903,6 +921,12 @@ export function EvaluationWorkspace({
   const [question, setQuestion] = useState<Question | null>(null);
   const [progress, setProgress] = useState<Progress | null>(null);
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
+  const [agentJob, setAgentJob] = useState<AgentJob>({
+    enabled: false,
+    reviews: [],
+  });
+  const [agentDecisionId, setAgentDecisionId] = useState<string | null>(null);
+  const [startingAgent, setStartingAgent] = useState(false);
   const [pendingAiResult, setPendingAiResult] =
     useState<AiVisionResult | null>(null);
   const [acceptingAiResult, setAcceptingAiResult] = useState(false);
@@ -979,19 +1003,40 @@ export function EvaluationWorkspace({
       questionData,
       progressData,
       annotationData,
+      agentData,
     ] = await Promise.all([
       api<Evaluation>(`/evaluations/${evaluationId}`),
       api<Page[]>(`/evaluations/${evaluationId}/pages`),
       api<Question[]>(`/evaluations/${evaluationId}/questions`),
       api<Progress>(`/evaluations/${evaluationId}/progress`),
       api<Annotation[]>(`/evaluations/${evaluationId}/annotations`),
+      api<AgentJob>(`/evaluations/${evaluationId}/agent`),
     ]);
     setEvaluation(evaluationData);
     setPages(pageData);
     setQuestions(questionData);
     setProgress(progressData);
     setAnnotations(annotationData);
+    setAgentJob(agentData);
     return questionData;
+  }, [evaluationId]);
+
+  const loadAgentJob = useCallback(async () => {
+    let agentData = await api<AgentJob>(
+      `/evaluations/${evaluationId}/agent`,
+    );
+    if (
+      agentData.enabled &&
+      syncableAgentStatuses.has(agentData.status || "") &&
+      agentData.cornerstone_job_id
+    ) {
+      agentData = await api<AgentJob>(
+        `/evaluations/${evaluationId}/agent/sync`,
+        { method: "POST" },
+      );
+    }
+    setAgentJob(agentData);
+    return agentData;
   }, [evaluationId]);
 
   const selectQuestion = useCallback(
@@ -1040,6 +1085,19 @@ export function EvaluationWorkspace({
   }, [loadOverview, selectQuestion]);
 
   useEffect(() => {
+    if (
+      !agentJob.enabled ||
+      !activeAgentStatuses.has(agentJob.status || "")
+    ) {
+      return undefined;
+    }
+    const timer = window.setInterval(() => {
+      void loadAgentJob().catch((error: Error) => setNotice(error.message));
+    }, 1800);
+    return () => window.clearInterval(timer);
+  }, [agentJob.enabled, agentJob.status, loadAgentJob]);
+
+  useEffect(() => {
     rightPanelRef.current?.scrollTo({ top: 0 });
   }, [question?.question_id]);
 
@@ -1073,6 +1131,16 @@ export function EvaluationWorkspace({
     if (!question?.steps?.length) return null;
     return question.steps.find((step) => step.awarded_marks === null) || null;
   }, [question]);
+
+  const activeAgentReview = useMemo(
+    () =>
+      agentJob.reviews.find(
+        (review) =>
+          review.question_id === question?.question_id &&
+          review.status !== "rejected",
+      ) || null,
+    [agentJob.reviews, question?.question_id],
+  );
 
   const showAlreadyMarkedWarning = () => {
     if (markingWarningTimerRef.current) {
@@ -1701,6 +1769,75 @@ export function EvaluationWorkspace({
     }
   };
 
+  const startAgentReview = async () => {
+    setStartingAgent(true);
+    setNotice("");
+    try {
+      const result = await api<AgentJob>(
+        `/evaluations/${evaluationId}/agent/start`,
+        { method: "POST" },
+      );
+      setAgentJob(result);
+      setNotice(
+        result.cornerstone_job_id
+          ? "Cornerstone job started. Waiting for coordinates."
+          : "Agent job queued.",
+      );
+    } catch (error) {
+      setNotice(
+        error instanceof Error ? error.message : "Unable to start agent mode",
+      );
+    } finally {
+      setStartingAgent(false);
+    }
+  };
+
+  const acceptAgentReview = async (review: AgentReview) => {
+    setAgentDecisionId(review.id);
+    setNotice("");
+    try {
+      const result = await api<AgentAcceptResponse>(
+        `/evaluations/${evaluationId}/agent/reviews/${review.id}/accept`,
+        { method: "POST" },
+      );
+      setAgentJob(result.agent);
+      await refreshQuestionState(result.question.question_id);
+      expandQuestionTotal(result.annotation.annotation_id);
+      setNotice(
+        `${result.question.question_no} agent marks accepted: ${formatMark(
+          result.question.awarded_marks,
+        )}/${formatMark(result.question.max_marks)}.`,
+      );
+      await moveToNextQuestion(result.question.question_id);
+    } catch (error) {
+      setNotice(
+        error instanceof Error ? error.message : "Unable to accept agent marks",
+      );
+    } finally {
+      setAgentDecisionId(null);
+    }
+  };
+
+  const rejectAgentReview = async (review: AgentReview) => {
+    setAgentDecisionId(review.id);
+    setNotice("");
+    try {
+      const result = await api<AgentRejectResponse>(
+        `/evaluations/${evaluationId}/agent/reviews/${review.id}/reject`,
+        { method: "POST" },
+      );
+      setAgentJob(result.agent);
+      setNotice(`${review.question_no} agent marks rejected.`);
+      await moveToNextQuestion(review.question_id);
+    } catch (error) {
+      setNotice(
+        error instanceof Error ? error.message : "Unable to reject agent marks",
+      );
+    } finally {
+      setAgentDecisionId(null);
+    }
+  };
+
   const submitEvaluation = async () => {
     setNotice("");
     setActionMenuOpen(false);
@@ -1737,7 +1874,7 @@ export function EvaluationWorkspace({
       const loadedPages = await Promise.all(
         pages.map(async (page) => ({
           page,
-          image: await loadExportImage(`${API_BASE}${page.image_url}`),
+          image: await loadExportImage(resolveImageUrl(page.image_url)),
         })),
       );
       if (loadedPages.length === 0) {
@@ -1863,6 +2000,11 @@ export function EvaluationWorkspace({
   const workspaceStyle = {
     "--right-panel-width": rightOpen ? `${rightWidth}px` : "0px",
   } as CSSProperties;
+  const agentToggleBusy =
+    startingAgent ||
+    activeAgentStatuses.has(agentJob.status || "");
+  const canStartAgent =
+    !agentJob.enabled || agentJob.status === "failed";
 
   return (
     <main
@@ -1891,6 +2033,23 @@ export function EvaluationWorkspace({
           </span>
         </div>
         <div className="header-metadata">
+          <button
+            aria-checked={agentJob.enabled}
+            className={`header-agent-toggle ${agentJob.enabled ? "is-on" : ""}`}
+            disabled={!canStartAgent || agentToggleBusy}
+            onClick={(event) => {
+              event.stopPropagation();
+              if (canStartAgent && !agentToggleBusy) void startAgentReview();
+            }}
+            role="switch"
+            title={agentJob.enabled ? "Agent mode is on" : "Start agent mode"}
+            type="button"
+          >
+            <small>Agent mode</small>
+            <span className="header-agent-switch" aria-hidden="true">
+              <span />
+            </span>
+          </button>
           <span>
             <small>Class</small>
             {evaluation.class_code}
@@ -2154,10 +2313,15 @@ export function EvaluationWorkspace({
                 pendingAiResult?.page_id === page.page_id
                   ? pendingAiResult
                   : null;
+              const agentBox =
+                activeAgentReview?.page_id === page.page_id
+                  ? activeAgentReview.bbox
+                  : null;
               return (
                 <div className="answer-page-frame" key={page.page_id}>
                   <span className="page-number-label">
                     Page {page.page_number}
+                    {page.image_space === "enhanced" ? " · Enhanced" : ""}
                   </span>
                   <div
                     className="answer-page"
@@ -2185,8 +2349,21 @@ export function EvaluationWorkspace({
                       alt={`Answer sheet page ${page.page_number}`}
                       crossOrigin="anonymous"
                       draggable={false}
-                      src={`${API_BASE}${page.image_url}`}
+                      src={resolveImageUrl(page.image_url)}
                     />
+                    {agentBox && (
+                      <div
+                        className="agent-question-box"
+                        style={{
+                          left: `${agentBox.x * 100}%`,
+                          top: `${agentBox.y * 100}%`,
+                          width: `${agentBox.w * 100}%`,
+                          height: `${agentBox.h * 100}%`,
+                        }}
+                      >
+                        <span>{activeAgentReview?.question_no}</span>
+                      </div>
+                    )}
                     <svg
                       aria-hidden="true"
                       className="drawing-layer"
@@ -2362,6 +2539,84 @@ export function EvaluationWorkspace({
         </div>
         {question && (
           <>
+            {activeAgentReview && (
+              <section className="agent-proposal-section">
+                <article
+                  className={`agent-proposal agent-proposal-${activeAgentReview.status}`}
+                >
+                  {activeAgentReview.enhanced_image_url && (
+                    <img
+                      alt={`Enhanced answer segment for ${activeAgentReview.question_no}`}
+                      src={resolveImageUrl(activeAgentReview.enhanced_image_url)}
+                    />
+                  )}
+                  <div className="agent-proposal-body">
+                    <div className="agent-proposal-heading">
+                      <span>
+                        {activeAgentReview.area_count} enhanced{" "}
+                        {activeAgentReview.area_count === 1
+                          ? "segment"
+                          : "segments"}
+                      </span>
+                      <strong>
+                        {activeAgentReview.awarded_marks ?? 0}/
+                        {activeAgentReview.max_marks}
+                      </strong>
+                    </div>
+                    {activeAgentReview.marks && question.steps && (
+                      <div className="agent-step-marks">
+                        {question.steps.map((step, index) => (
+                          <span key={step.step_id}>
+                            <small>
+                              S{step.step_no} · {step.title}
+                            </small>
+                            <strong>
+                              {formatMark(
+                                activeAgentReview.marks?.[index] || 0,
+                              )}
+                              /{formatMark(step.max_marks)}
+                            </strong>
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    {activeAgentReview.status === "ready" && (
+                      <div className="agent-proposal-actions">
+                        <button
+                          className="agent-accept"
+                          disabled={agentDecisionId === activeAgentReview.id}
+                          onClick={() => void acceptAgentReview(activeAgentReview)}
+                          type="button"
+                        >
+                          {agentDecisionId === activeAgentReview.id
+                            ? "Applying..."
+                            : "Accept & next"}
+                        </button>
+                        <button
+                          className="agent-reject"
+                          disabled={agentDecisionId === activeAgentReview.id}
+                          onClick={() => void rejectAgentReview(activeAgentReview)}
+                          type="button"
+                        >
+                          Reject
+                        </button>
+                      </div>
+                    )}
+                    {activeAgentReview.status !== "ready" && (
+                      <p className="agent-review-outcome">
+                        {activeAgentReview.status === "accepted"
+                          ? "Accepted and applied to this question."
+                          : activeAgentReview.status === "rejected"
+                            ? "Rejected. Marks were not changed."
+                            : activeAgentReview.status === "error"
+                              ? activeAgentReview.error
+                              : "This proposal is still being prepared."}
+                      </p>
+                    )}
+                  </div>
+                </article>
+              </section>
+            )}
             <section>
               <h2>
                 {question.question_no}. {question.question_text}

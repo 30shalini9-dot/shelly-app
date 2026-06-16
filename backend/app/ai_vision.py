@@ -171,7 +171,7 @@ def build_evaluation_prompt(
 
 def evaluate_answer(
     question: str,
-    image_path: str,
+    image_path: str | list[str],
     model: str = MODEL,
 ) -> dict:
     try:
@@ -181,10 +181,13 @@ def evaluate_answer(
             "The ollama Python package is required for AI Vision evaluation"
         ) from exc
 
-    image_file = Path(image_path).expanduser()
-
-    if not image_file.exists():
-        raise FileNotFoundError(image_path)
+    image_paths = [image_path] if isinstance(image_path, str) else image_path
+    image_files = [Path(path).expanduser() for path in image_paths]
+    if not image_files:
+        raise ValueError("At least one answer image is required")
+    for image_file in image_files:
+        if not image_file.exists():
+            raise FileNotFoundError(str(image_file))
 
     messages: list[dict[str, Any]] = [
         {
@@ -194,7 +197,7 @@ def evaluate_answer(
         {
             "role": "user",
             "content": question,
-            "images": [str(image_file.resolve())],
+            "images": [str(image_file.resolve()) for image_file in image_files],
         },
     ]
 
