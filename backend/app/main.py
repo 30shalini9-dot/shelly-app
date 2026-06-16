@@ -192,6 +192,22 @@ def create_app(
             return {"enabled": False, "reviews": []}
         return {"enabled": True, **job}
 
+    def revive_ignored_cornerstone_job(job: dict[str, Any]) -> dict[str, Any]:
+        if job.get("status") != "ignored" or not job.get("cornerstone_job_id"):
+            return job
+        database.update_agent_job(
+            job["id"],
+            status="extracting",
+            clear_error=True,
+            clear_completed_at=True,
+        )
+        return database.get_agent_job_by_id(job["id"]) or {
+            **job,
+            "status": "extracting",
+            "error": None,
+            "completed_at": None,
+        }
+
     async def start_agent_job(agent_job_id: str) -> None:
         pages = database.get_agent_job_pages(agent_job_id)
         if not pages:
@@ -745,6 +761,7 @@ def create_app(
         job = database.get_agent_job_for_evaluation(evaluation_id)
         if not job:
             return {"enabled": False, "reviews": []}
+        job = revive_ignored_cornerstone_job(job)
         if job.get("status") != "extracting" or not job.get("cornerstone_job_id"):
             return {"enabled": True, **job}
         try:

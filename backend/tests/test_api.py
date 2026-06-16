@@ -528,6 +528,87 @@ class ApiTestCase(unittest.TestCase):
         self.assertEqual(agent["status"], "ready")
         self.assertEqual(agent["reviews"][0]["marks"], [1.0])
 
+    def test_agent_sync_recovers_legacy_ignored_cornerstone_job(self) -> None:
+        self.assertEqual(
+            self.client.post("/question-papers", json=PAPER).status_code,
+            201,
+        )
+        submission = self.client.post(
+            "/submissions",
+            data={
+                "student_id": "AGENT-IGNORED",
+                "paper_code": "MATH-1-A",
+                "agent_mode": "true",
+            },
+            files=[
+                (
+                    "images",
+                    ("answer.png", b"original-page", "image/png"),
+                )
+            ],
+        ).json()
+        agent = self.client.get(
+            f"/evaluations/{submission['evaluation_id']}/agent"
+        ).json()
+        database.update_agent_job(
+            agent["id"],
+            status="ignored",
+            error="Expected 5 questions but Cornerstone detected 2; agent grading was skipped",
+            completed=True,
+        )
+        self.cornerstone_status_payloads.append(
+            {
+                "job_id": "cornerstone-1",
+                "status": "done",
+                "data": {
+                    "question_count": 2,
+                    "questions": [
+                        {
+                            "question_no": 1,
+                            "areas": [
+                                {
+                                    "page_index": 1,
+                                    "question_image_url": (
+                                        "http://localhost:8001/v1/jobs/"
+                                        "cornerstone-1/questions/1/areas/1/image"
+                                        "?space=enhanced"
+                                    ),
+                                }
+                            ],
+                        },
+                        {
+                            "question_no": 2,
+                            "areas": [
+                                {
+                                    "page_index": 1,
+                                    "question_image_url": (
+                                        "http://localhost:8001/v1/jobs/"
+                                        "cornerstone-1/questions/2/areas/1/image"
+                                        "?space=enhanced"
+                                    ),
+                                }
+                            ],
+                        },
+                    ],
+                },
+            }
+        )
+
+        sync = self.client.post(
+            f"/evaluations/{submission['evaluation_id']}/agent/sync"
+        )
+
+        self.assertEqual(sync.status_code, 200)
+        body = self.client.get(
+            f"/evaluations/{submission['evaluation_id']}/agent"
+        ).json()
+        self.assertEqual(body["status"], "ready")
+        self.assertIsNone(body["error"])
+        self.assertEqual(body["detected_questions"], 2)
+        self.assertEqual(body["processed_questions"], 1)
+        self.assertEqual(body["ready_questions"], 1)
+        self.assertEqual(body["reviews"][0]["marks"], [1.0])
+
     def test_agent_sync_reads_nested_result_and_uses_enhanced_page_image(self) -> None:
         self.assertEqual(
             self.client.post("/question-papers", json=PAPER).status_code,

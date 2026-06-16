@@ -266,6 +266,18 @@ def initialize_database() -> None:
             conn.execute(
                 "ALTER TABLE submission_pages ADD COLUMN enhanced_height INTEGER"
             )
+        conn.execute(
+            """
+            UPDATE agent_jobs
+            SET status = 'extracting',
+                error = NULL,
+                completed_at = NULL,
+                updated_at = ?
+            WHERE status = 'ignored'
+              AND cornerstone_job_id IS NOT NULL
+            """,
+            (now_iso(),),
+        )
 
 
 def reset_database() -> None:
@@ -832,6 +844,7 @@ def update_agent_job(
     error: str | None = None,
     completed: bool = False,
     clear_error: bool = False,
+    clear_completed_at: bool = False,
 ) -> None:
     values: dict[str, Any] = {"updated_at": now_iso()}
     if status is not None:
@@ -850,6 +863,8 @@ def update_agent_job(
         values["error"] = None
     if completed:
         values["completed_at"] = now_iso()
+    elif clear_completed_at:
+        values["completed_at"] = None
     assignments = ", ".join(f"{key} = ?" for key in values)
     with connection() as conn:
         cursor = conn.execute(

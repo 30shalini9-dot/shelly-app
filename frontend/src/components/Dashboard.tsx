@@ -2,6 +2,17 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "../api";
 import type { EvaluationListItem } from "../types";
 
+const activeAgentStatuses = new Set(["queued", "extracting", "evaluating", "ignored"]);
+const syncableAgentStatuses = new Set(["extracting", "ignored"]);
+
+function agentStatusLabel(status: EvaluationListItem["agent_status"]) {
+  if (status === "ready") return "Review ready";
+  if (status === "completed") return "Reviewed";
+  if (status === "ignored") return "Extracting";
+  if (status === "failed") return "Needs attention";
+  return status || "Queued";
+}
+
 interface DashboardProps {
   onOpenEvaluation: (id: string) => void;
   notice?: string;
@@ -13,14 +24,16 @@ export function Dashboard({ notice, onOpenEvaluation }: DashboardProps) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
-  const syncExtractingAgentJobs = useCallback(
+  const syncActiveAgentJobs = useCallback(
     async (items: EvaluationListItem[]) => {
-      const extracting = items.filter(
-        (item) => item.agent_mode && item.agent_status === "extracting",
+      const syncable = items.filter(
+        (item) =>
+          item.agent_mode &&
+          syncableAgentStatuses.has(item.agent_status || ""),
       );
-      if (extracting.length === 0) return false;
+      if (syncable.length === 0) return false;
       await Promise.all(
-        extracting.map((item) =>
+        syncable.map((item) =>
           api(`/evaluations/${item.evaluation_id}/agent/sync`, {
             method: "POST",
           }).catch(() => undefined),
@@ -34,7 +47,7 @@ export function Dashboard({ notice, onOpenEvaluation }: DashboardProps) {
   const loadEvaluations = useCallback(async (shouldApply: () => boolean = () => true) => {
     try {
       let items = await api<EvaluationListItem[]>("/evaluations");
-      if (await syncExtractingAgentJobs(items)) {
+      if (await syncActiveAgentJobs(items)) {
         items = await api<EvaluationListItem[]>("/evaluations");
       }
       if (!shouldApply()) return;
@@ -51,7 +64,7 @@ export function Dashboard({ notice, onOpenEvaluation }: DashboardProps) {
       if (!shouldApply()) return;
       setLoading(false);
     }
-  }, [syncExtractingAgentJobs]);
+  }, [syncActiveAgentJobs]);
 
   useEffect(() => {
     let active = true;
@@ -65,7 +78,7 @@ export function Dashboard({ notice, onOpenEvaluation }: DashboardProps) {
     const hasActiveAgentJob = evaluations.some(
       (item) =>
         item.agent_mode &&
-        ["queued", "extracting", "evaluating"].includes(item.agent_status || ""),
+        activeAgentStatuses.has(item.agent_status || ""),
     );
     if (!hasActiveAgentJob) return undefined;
     const timer = window.setInterval(() => void loadEvaluations(), 2500);
@@ -188,15 +201,7 @@ export function Dashboard({ notice, onOpenEvaluation }: DashboardProps) {
                           }`}
                         >
                           <span aria-hidden="true" />
-                          {evaluation.agent_status === "ready"
-                            ? "Review ready"
-                            : evaluation.agent_status === "completed"
-                              ? "Reviewed"
-                              : evaluation.agent_status === "ignored"
-                                ? "Skipped"
-                                : evaluation.agent_status === "failed"
-                                  ? "Needs attention"
-                                  : evaluation.agent_status || "Queued"}
+                          {agentStatusLabel(evaluation.agent_status)}
                         </span>
                       ) : (
                         <span className="muted">Manual</span>

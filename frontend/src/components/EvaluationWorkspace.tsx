@@ -103,6 +103,8 @@ interface QuestionTotalSummary {
 const TOTAL_ANNOTATION_PREFIX = "T|";
 const AI_TOTAL_ANNOTATION_PREFIX = "TAI|";
 const LEGACY_TOTAL_ANNOTATION_PREFIX = "TOTAL:";
+const activeAgentStatuses = new Set(["queued", "extracting", "evaluating", "ignored"]);
+const syncableAgentStatuses = new Set(["extracting", "ignored"]);
 
 function formatMark(value: number) {
   return Number.isInteger(value)
@@ -1025,7 +1027,7 @@ export function EvaluationWorkspace({
     );
     if (
       agentData.enabled &&
-      agentData.status === "extracting" &&
+      syncableAgentStatuses.has(agentData.status || "") &&
       agentData.cornerstone_job_id
     ) {
       agentData = await api<AgentJob>(
@@ -1085,7 +1087,7 @@ export function EvaluationWorkspace({
   useEffect(() => {
     if (
       !agentJob.enabled ||
-      !["queued", "extracting", "evaluating"].includes(agentJob.status || "")
+      !activeAgentStatuses.has(agentJob.status || "")
     ) {
       return undefined;
     }
@@ -2000,9 +2002,9 @@ export function EvaluationWorkspace({
   } as CSSProperties;
   const agentToggleBusy =
     startingAgent ||
-    ["queued", "extracting", "evaluating"].includes(agentJob.status || "");
+    activeAgentStatuses.has(agentJob.status || "");
   const canStartAgent =
-    !agentJob.enabled || ["failed", "ignored"].includes(agentJob.status || "");
+    !agentJob.enabled || agentJob.status === "failed";
 
   return (
     <main
