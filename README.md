@@ -218,9 +218,14 @@ Resetting a question removes its step marks and answer-sheet mark labels.
 In the evaluation workspace, right-click an answer page and choose
 **AI Vision selection**, then drag a rectangle around the answer area. The
 frontend sends the cropped image, current question, page, and rectangle
-coordinates as multipart form data. The backend loads the question text,
-reference solution, and ordered marking steps from SQLite before calling the
-local Ollama model:
+coordinates as multipart form data. For demo/testing, Agent Vision currently
+runs in dummy evaluation mode by default: it waits 5 seconds, assigns full marks
+to every configured step, and returns the same response shape the UI already
+expects. The real local Ollama evaluation path remains in place but is disabled
+while dummy mode is enabled.
+
+Set `SHELDON_AI_VISION_DUMMY_FULL_MARKS=false` to restore the local Ollama model
+flow:
 
 ```bash
 ollama pull qwen3.5:4b

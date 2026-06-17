@@ -4,6 +4,7 @@ import {
   PointerEvent,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -100,16 +101,284 @@ interface QuestionTotalSummary {
   max: number;
 }
 
+interface AgentCardPosition {
+  x: number;
+  y: number;
+}
+
+interface AgentCardStoredPosition extends AgentCardPosition {
+  pinned?: boolean;
+}
+
+interface AgentCardSize {
+  w: number;
+  h: number;
+}
+
+interface AgentReviewBox {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+interface AgentReviewAreaPlacement {
+  review: AgentReview;
+  hue: number;
+  pageId: string;
+  box: AgentReviewBox;
+  areaIndex: number;
+  areaCount: number;
+  isFinal: boolean;
+}
+
+interface AgentReviewArea {
+  pageId: string;
+  pageNumber: number | null;
+  areaIndex: number;
+  box: AgentReviewBox;
+}
+
+interface AgentCardPlacement {
+  review: AgentReview;
+  hue: number;
+  anchorBox: AgentReviewBox | null;
+  position: AgentCardPosition;
+  isStored: boolean;
+}
+
 const TOTAL_ANNOTATION_PREFIX = "T|";
 const AI_TOTAL_ANNOTATION_PREFIX = "TAI|";
 const LEGACY_TOTAL_ANNOTATION_PREFIX = "TOTAL:";
 const activeAgentStatuses = new Set(["queued", "extracting", "evaluating", "ignored"]);
 const syncableAgentStatuses = new Set(["extracting", "ignored"]);
+const AGENT_COLOR_STEP = 137.508;
+const AGENT_CARD_WIDTH_RATIO = 0.36;
+const AGENT_CARD_HEIGHT_RATIO = 0.22;
+const AGENT_CARD_GAP = 0.014;
 
 function formatMark(value: number) {
   return Number.isInteger(value)
     ? String(value)
     : String(Number(value.toFixed(2)));
+}
+
+function clampAgentCardPosition(
+  position: AgentCardPosition,
+  size: AgentCardSize = {
+    w: AGENT_CARD_WIDTH_RATIO,
+    h: AGENT_CARD_HEIGHT_RATIO,
+  },
+) {
+  const width = Math.min(
+    1,
+    Math.max(0, Number.isFinite(size.w) ? size.w : AGENT_CARD_WIDTH_RATIO),
+  );
+  const height = Math.min(
+    1,
+    Math.max(0, Number.isFinite(size.h) ? size.h : AGENT_CARD_HEIGHT_RATIO),
+  );
+  const maxX = Math.max(0, 1 - width);
+  const maxY = Math.max(0, 1 - height);
+  return {
+    x: Math.min(maxX, Math.max(0, Number.isFinite(position.x) ? position.x : 0)),
+    y: Math.min(maxY, Math.max(0, Number.isFinite(position.y) ? position.y : 0)),
+  };
+}
+
+function agentCardSizeFromElements(
+  cardElement: HTMLElement,
+  pageElement: HTMLElement,
+): AgentCardSize {
+  return {
+    w: cardElement.offsetWidth / pageElement.clientWidth,
+    h: cardElement.offsetHeight / pageElement.clientHeight,
+  };
+}
+
+function agentReviewHue(review: AgentReview, fallbackIndex: number) {
+  const seed = Math.max(0, (review.question_order || fallbackIndex + 1) - 1);
+  return Math.round((264 + seed * AGENT_COLOR_STEP) % 360);
+}
+
+function overlapsAgentCard(
+  first: { x: number; y: number; w: number; h: number },
+  second: { x: number; y: number; w: number; h: number },
+) {
+  return (
+    first.x < second.x + second.w + AGENT_CARD_GAP &&
+    first.x + first.w + AGENT_CARD_GAP > second.x &&
+    first.y < second.y + second.h + AGENT_CARD_GAP &&
+    first.y + first.h + AGENT_CARD_GAP > second.y
+  );
+}
+
+function normalizeAgentReviewBox(
+  box: { x: number; y: number; w: number; h: number } | null | undefined,
+): AgentReviewBox | null {
+  if (
+    !box ||
+    !Number.isFinite(box.x) ||
+    !Number.isFinite(box.y) ||
+    !Number.isFinite(box.w) ||
+    !Number.isFinite(box.h)
+  ) {
+    return null;
+  }
+  const x = Math.min(1, Math.max(0, box.x));
+  const y = Math.min(1, Math.max(0, box.y));
+  const w = Math.min(1 - x, Math.max(0, box.w));
+  const h = Math.min(1 - y, Math.max(0, box.h));
+  if (w <= 0 || h <= 0) return null;
+  return { x, y, w, h };
+}
+
+function agentReviewAreas(review: AgentReview): AgentReviewArea[] {
+  const explicitAreas = Array.isArray(review.areas)
+    ? review.areas
+        .map((area, index) => {
+          const box = normalizeAgentReviewBox(area.bbox);
+          if (!area.page_id || !box) return null;
+          return {
+            pageId: area.page_id,
+            pageNumber: area.page_number,
+            areaIndex: area.area_index || index + 1,
+            box,
+          };
+        })
+        .filter((area): area is AgentReviewArea => Boolean(area))
+    : [];
+  if (explicitAreas.length > 0) return explicitAreas;
+
+  const fallbackBox = normalizeAgentReviewBox(review.bbox);
+  if (!review.page_id || !fallbackBox) return [];
+  return [
+    {
+      pageId: review.page_id,
+      pageNumber: null,
+      areaIndex: 1,
+      box: fallbackBox,
+    },
+  ];
+}
+
+function agentReviewAreasForPage(
+  review: AgentReview,
+  pageId: string,
+  fallbackIndex: number,
+): AgentReviewAreaPlacement[] {
+  const areas = agentReviewAreas(review);
+  const finalArea = areas[areas.length - 1];
+  const hue = agentReviewHue(review, fallbackIndex);
+  return areas
+    .map((area, index) => ({
+      review,
+      hue,
+      pageId: area.pageId,
+      box: area.box,
+      areaIndex: area.areaIndex || index + 1,
+      areaCount: areas.length,
+      isFinal: area === finalArea,
+    }))
+    .filter((area) => area.pageId === pageId);
+}
+
+function automaticAgentCardPosition(
+  anchorBox: AgentReviewBox | null,
+  occupied: Array<{ x: number; y: number; w: number; h: number }>,
+  size: AgentCardSize = {
+    w: AGENT_CARD_WIDTH_RATIO,
+    h: AGENT_CARD_HEIGHT_RATIO,
+  },
+) {
+  const box = anchorBox;
+  const cardSize = {
+    w: Math.min(
+      1,
+      Math.max(0, Number.isFinite(size.w) ? size.w : AGENT_CARD_WIDTH_RATIO),
+    ),
+    h: Math.min(
+      1,
+      Math.max(0, Number.isFinite(size.h) ? size.h : AGENT_CARD_HEIGHT_RATIO),
+    ),
+  };
+  const centeredX = box
+    ? box.x + box.w / 2 - cardSize.w / 2
+    : 0.5 - cardSize.w / 2;
+  const belowY = box ? box.y + box.h + AGENT_CARD_GAP : 0.08;
+  const aboveY = box ? box.y - cardSize.h - AGENT_CARD_GAP : belowY;
+  const belowHasRoom = belowY + cardSize.h <= 1;
+  const candidates: AgentCardPosition[] = box
+    ? belowHasRoom
+      ? [
+          { x: centeredX, y: belowY },
+          { x: centeredX, y: aboveY },
+        ]
+      : [
+          { x: centeredX, y: aboveY },
+          { x: centeredX, y: belowY },
+        ]
+    : [{ x: centeredX, y: belowY }];
+
+  for (const candidate of candidates) {
+    let position = clampAgentCardPosition(candidate, cardSize);
+    const verticalStep =
+      position.y < (box?.y ?? belowY)
+        ? -(cardSize.h + AGENT_CARD_GAP)
+        : cardSize.h + AGENT_CARD_GAP;
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const cardBox = {
+        ...position,
+        w: cardSize.w,
+        h: cardSize.h,
+      };
+      if (!occupied.some((item) => overlapsAgentCard(cardBox, item))) {
+        return position;
+      }
+      position = clampAgentCardPosition({
+        x: position.x,
+        y: position.y + verticalStep,
+      }, cardSize);
+    }
+  }
+
+  return clampAgentCardPosition(
+    {
+      x: centeredX,
+      y: belowHasRoom ? belowY : aboveY,
+    },
+    cardSize,
+  );
+}
+
+function placeAgentCards(
+  reviews: AgentReview[],
+  storedPositions: Record<string, AgentCardStoredPosition>,
+  pageId: string,
+) {
+  const occupied: Array<{ x: number; y: number; w: number; h: number }> = [];
+  return reviews.flatMap((review, index) => {
+    const areas = agentReviewAreas(review);
+    const anchorArea = areas[areas.length - 1];
+    if (!anchorArea || anchorArea.pageId !== pageId) return [];
+    const storedPosition = storedPositions[review.id];
+    const isStored = Boolean(storedPosition?.pinned);
+    const position = storedPosition
+      ? clampAgentCardPosition(storedPosition)
+      : automaticAgentCardPosition(anchorArea.box, occupied);
+    occupied.push({
+      ...position,
+      w: AGENT_CARD_WIDTH_RATIO,
+      h: AGENT_CARD_HEIGHT_RATIO,
+    });
+    return {
+      review,
+      hue: agentReviewHue(review, index),
+      anchorBox: anchorArea.box,
+      position,
+      isStored,
+    };
+  });
 }
 
 function serializeQuestionTotal(question: Question) {
@@ -714,6 +983,196 @@ function AiResultCard({
   );
 }
 
+interface AgentCanvasCardProps {
+  placement: AgentCardPlacement;
+  questionDetail?: Question;
+  deciding: boolean;
+  onAccept: (review: AgentReview) => void;
+  onReject: (review: AgentReview) => void;
+  onFocus: (review: AgentReview) => void;
+  onDragCancel: (event: PointerEvent<HTMLElement>) => void;
+  onDragEnd: (event: PointerEvent<HTMLElement>) => void;
+  onDragMove: (event: PointerEvent<HTMLElement>) => void;
+  onDragStart: (
+    event: PointerEvent<HTMLElement>,
+    review: AgentReview,
+  ) => void;
+  onPositionClamp: (
+    review: AgentReview,
+    position: AgentCardPosition,
+    pinned: boolean,
+  ) => void;
+}
+
+function AgentCanvasCard({
+  placement,
+  questionDetail,
+  deciding,
+  onAccept,
+  onReject,
+  onFocus,
+  onDragCancel,
+  onDragEnd,
+  onDragMove,
+  onDragStart,
+  onPositionClamp,
+}: AgentCanvasCardProps) {
+  const { review, hue, anchorBox, position, isStored } = placement;
+  const marks = review.marks || [];
+  const cardRef = useRef<HTMLElement | null>(null);
+
+  useLayoutEffect(() => {
+    const cardElement = cardRef.current;
+    const pageElement = cardElement?.closest(".answer-page") as
+      | HTMLElement
+      | null;
+    if (!cardElement || !pageElement) {
+      return undefined;
+    }
+
+    let frameId: number | null = null;
+    const updatePosition = () => {
+      if (
+        pageElement.clientWidth === 0 ||
+        pageElement.clientHeight === 0
+      ) {
+        return;
+      }
+      const cardSize = agentCardSizeFromElements(cardElement, pageElement);
+      const clamped = isStored
+        ? clampAgentCardPosition(position, cardSize)
+        : automaticAgentCardPosition(anchorBox, [], cardSize);
+      if (
+        Math.abs(clamped.x - position.x) > 0.001 ||
+        Math.abs(clamped.y - position.y) > 0.001
+      ) {
+        onPositionClamp(review, clamped, isStored);
+      }
+    };
+    const scheduleUpdate = () => {
+      if (frameId !== null) {
+        window.cancelAnimationFrame(frameId);
+      }
+      frameId = window.requestAnimationFrame(() => {
+        frameId = null;
+        updatePosition();
+      });
+    };
+
+    updatePosition();
+    const observer =
+      typeof ResizeObserver === "undefined"
+        ? null
+        : new ResizeObserver(scheduleUpdate);
+    observer?.observe(cardElement);
+    observer?.observe(pageElement);
+
+    return () => {
+      if (frameId !== null) {
+        window.cancelAnimationFrame(frameId);
+      }
+      observer?.disconnect();
+    };
+  }, [
+    isStored,
+    marks.length,
+    onPositionClamp,
+    position,
+    questionDetail?.question_id,
+    questionDetail?.steps?.length,
+    anchorBox,
+    review,
+  ]);
+
+  return (
+    <article
+      className="agent-canvas-card"
+      onClick={(event) => {
+        event.stopPropagation();
+        onFocus(review);
+      }}
+      onContextMenu={(event) => event.stopPropagation()}
+      onPointerCancel={onDragCancel}
+      onPointerDown={(event) => onDragStart(event, review)}
+      onPointerMove={onDragMove}
+      onPointerUp={onDragEnd}
+      ref={cardRef}
+      style={
+        {
+          "--agent-review-color": `hsl(${hue} 64% 43%)`,
+          "--agent-review-fill": `hsla(${hue}, 78%, 55%, 0.2)`,
+          left: `${position.x * 100}%`,
+          top: `${position.y * 100}%`,
+        } as CSSProperties
+      }
+      title="Drag this AI review card"
+    >
+      <div className="agent-canvas-card-heading">
+        <span>Question Number</span>
+        <strong>{review.question_no}</strong>
+      </div>
+      <div className="agent-canvas-card-total">
+        <span>AI Suggested Marks</span>
+        <strong>
+          {formatMark(review.awarded_marks ?? 0)}/
+          {formatMark(review.max_marks)}
+        </strong>
+      </div>
+      <div className="agent-canvas-card-steps">
+        <p>Step-wise Marks</p>
+        {marks.length > 0 ? (
+          marks.map((mark, index) => {
+            const step = questionDetail?.steps?.[index];
+            return (
+              <span key={step?.step_id || `${review.id}-${index}`}>
+                <small>
+                  S{step?.step_no ?? index + 1}
+                  {step?.title ? ` · ${step.title}` : ""}
+                </small>
+                <strong>
+                  {formatMark(mark)}
+                  {step ? `/${formatMark(step.max_marks)}` : ""}
+                </strong>
+              </span>
+            );
+          })
+        ) : (
+          <span>
+            <small>Marks pending</small>
+            <strong>-</strong>
+          </span>
+        )}
+      </div>
+      <div className="agent-canvas-card-actions">
+        <button
+          className="agent-accept"
+          disabled={deciding}
+          onClick={(event) => {
+            event.stopPropagation();
+            onAccept(review);
+          }}
+          onPointerDown={(event) => event.stopPropagation()}
+          type="button"
+        >
+          {deciding ? "Applying..." : "Accept & Next"}
+        </button>
+        <button
+          className="agent-reject"
+          disabled={deciding}
+          onClick={(event) => {
+            event.stopPropagation();
+            onReject(review);
+          }}
+          onPointerDown={(event) => event.stopPropagation()}
+          type="button"
+        >
+          Reject
+        </button>
+      </div>
+    </article>
+  );
+}
+
 function MarkAnnotation({
   annotation,
   expanded,
@@ -926,6 +1385,12 @@ export function EvaluationWorkspace({
     reviews: [],
   });
   const [agentDecisionId, setAgentDecisionId] = useState<string | null>(null);
+  const [agentCardPositions, setAgentCardPositions] = useState<
+    Record<string, AgentCardStoredPosition>
+  >({});
+  const [agentQuestionDetails, setAgentQuestionDetails] = useState<
+    Record<string, Question>
+  >({});
   const [startingAgent, setStartingAgent] = useState(false);
   const [pendingAiResult, setPendingAiResult] =
     useState<AiVisionResult | null>(null);
@@ -986,6 +1451,12 @@ export function EvaluationWorkspace({
   const activeTextDragRef = useRef<{
     pageId: string;
     itemId: string;
+    offsetX: number;
+    offsetY: number;
+  } | null>(null);
+  const agentCardDragRef = useRef<{
+    reviewId: string;
+    pointerId: number;
     offsetX: number;
     offsetY: number;
   } | null>(null);
@@ -1132,15 +1603,79 @@ export function EvaluationWorkspace({
     return question.steps.find((step) => step.awarded_marks === null) || null;
   }, [question]);
 
-  const activeAgentReview = useMemo(
-    () =>
-      agentJob.reviews.find(
-        (review) =>
-          review.question_id === question?.question_id &&
-          review.status !== "rejected",
-      ) || null,
-    [agentJob.reviews, question?.question_id],
+  const activeAgentReview = useMemo(() => {
+    const readyReviewsByQuestion = new Map(
+      agentJob.reviews
+        .filter(
+          (review) =>
+            review.status === "ready" &&
+            agentReviewAreas(review).length > 0,
+        )
+        .map((review) => [review.question_id, review]),
+    );
+    const nextQuestion = [...questions]
+      .sort((first, second) => first.display_order - second.display_order)
+      .find((item) => item.status !== "Completed");
+    if (!nextQuestion) return null;
+    return readyReviewsByQuestion.get(nextQuestion.question_id) || null;
+  }, [agentJob.reviews, questions]);
+
+  const activeAgentReviews = useMemo(
+    () => (activeAgentReview ? [activeAgentReview] : []),
+    [activeAgentReview],
   );
+
+  useEffect(() => {
+    const activeIds = new Set(activeAgentReviews.map((review) => review.id));
+    setAgentCardPositions((current) => {
+      const entries = Object.entries(current).filter(([id]) =>
+        activeIds.has(id),
+      );
+      if (entries.length === Object.keys(current).length) return current;
+      return Object.fromEntries(entries);
+    });
+  }, [activeAgentReviews]);
+
+  useEffect(() => {
+    const questionId = activeAgentReview?.question_id;
+    if (!questionId || agentQuestionDetails[questionId]) return undefined;
+
+    let cancelled = false;
+    void api<Question>(`/evaluations/${evaluationId}/questions/${questionId}`)
+      .then((detail) => {
+        if (cancelled) return;
+        setAgentQuestionDetails((current) => ({
+          ...current,
+          [detail.question_id]: detail,
+        }));
+      })
+      .catch(() => undefined);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    activeAgentReview?.question_id,
+    agentQuestionDetails,
+    evaluationId,
+  ]);
+
+  useEffect(() => {
+    if (
+      !activeAgentReview ||
+      !question ||
+      question?.question_id === activeAgentReview.question_id
+    ) {
+      return;
+    }
+    void selectQuestion(activeAgentReview.question_id).catch((error: Error) =>
+      setNotice(error.message),
+    );
+  }, [
+    activeAgentReview,
+    question?.question_id,
+    selectQuestion,
+  ]);
 
   const showAlreadyMarkedWarning = () => {
     if (markingWarningTimerRef.current) {
@@ -1244,6 +1779,28 @@ export function EvaluationWorkspace({
   const moveToNextQuestion = async (questionId: string) => {
     const nextId = nextQuestionId(questionId);
     if (nextId) await selectQuestion(nextId);
+    else setNotice("All questions have been marked.");
+  };
+
+  const moveToNextPendingQuestion = async (questionId: string) => {
+    const questionData = await api<Question[]>(
+      `/evaluations/${evaluationId}/questions`,
+    );
+    setQuestions(questionData);
+    const currentIndex = questionData.findIndex(
+      (item) => item.question_id === questionId,
+    );
+    const orderedQuestions =
+      currentIndex >= 0
+        ? [
+            ...questionData.slice(currentIndex + 1),
+            ...questionData.slice(0, currentIndex),
+          ]
+        : questionData;
+    const nextPending = orderedQuestions.find(
+      (item) => item.status !== "Completed",
+    );
+    if (nextPending) await selectQuestion(nextPending.question_id);
     else setNotice("All questions have been marked.");
   };
 
@@ -1582,6 +2139,85 @@ export function EvaluationWorkspace({
     return true;
   };
 
+  const beginAgentCardDrag = (
+    event: PointerEvent<HTMLElement>,
+    review: AgentReview,
+  ) => {
+    const target = event.target as HTMLElement;
+    if (event.button !== 0 || target.closest("button")) return;
+    const pageElement = event.currentTarget.closest(
+      ".answer-page",
+    ) as HTMLDivElement | null;
+    if (!pageElement || pageElement.clientWidth === 0 || pageElement.clientHeight === 0) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const pageBounds = pageElement.getBoundingClientRect();
+    const cardBounds = event.currentTarget.getBoundingClientRect();
+    agentCardDragRef.current = {
+      reviewId: review.id,
+      pointerId: event.pointerId,
+      offsetX: event.clientX - cardBounds.left,
+      offsetY: event.clientY - cardBounds.top,
+    };
+    const measuredSize = agentCardSizeFromElements(
+      event.currentTarget,
+      pageElement,
+    );
+    const measuredPosition = clampAgentCardPosition(
+      {
+        x: (cardBounds.left - pageBounds.left) / pageBounds.width,
+        y: (cardBounds.top - pageBounds.top) / pageBounds.height,
+      },
+      measuredSize,
+    );
+    setAgentCardPositions((current) => ({
+      ...current,
+      [review.id]: { ...measuredPosition, pinned: true },
+    }));
+  };
+
+  const moveAgentCardDrag = (event: PointerEvent<HTMLElement>) => {
+    const drag = agentCardDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const pageElement = event.currentTarget.closest(
+      ".answer-page",
+    ) as HTMLDivElement | null;
+    if (!pageElement || pageElement.clientWidth === 0 || pageElement.clientHeight === 0) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    const pageBounds = pageElement.getBoundingClientRect();
+    const cardBounds = event.currentTarget.getBoundingClientRect();
+    const next = clampAgentCardPosition(
+      {
+        x: (event.clientX - pageBounds.left - drag.offsetX) / pageBounds.width,
+        y: (event.clientY - pageBounds.top - drag.offsetY) / pageBounds.height,
+      },
+      {
+        w: cardBounds.width / pageBounds.width,
+        h: cardBounds.height / pageBounds.height,
+      },
+    );
+    setAgentCardPositions((current) => ({
+      ...current,
+      [drag.reviewId]: { ...next, pinned: true },
+    }));
+  };
+
+  const finishAgentCardDrag = (event: PointerEvent<HTMLElement>) => {
+    const drag = agentCardDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    event.stopPropagation();
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    agentCardDragRef.current = null;
+  };
+
   const beginAiSelection = (
     event: PointerEvent<HTMLDivElement>,
     pageId: string,
@@ -1808,7 +2444,7 @@ export function EvaluationWorkspace({
           result.question.awarded_marks,
         )}/${formatMark(result.question.max_marks)}.`,
       );
-      await moveToNextQuestion(result.question.question_id);
+      await moveToNextPendingQuestion(result.question.question_id);
     } catch (error) {
       setNotice(
         error instanceof Error ? error.message : "Unable to accept agent marks",
@@ -1828,7 +2464,7 @@ export function EvaluationWorkspace({
       );
       setAgentJob(result.agent);
       setNotice(`${review.question_no} agent marks rejected.`);
-      await moveToNextQuestion(review.question_id);
+      await selectQuestion(review.question_id);
     } catch (error) {
       setNotice(
         error instanceof Error ? error.message : "Unable to reject agent marks",
@@ -2313,10 +2949,15 @@ export function EvaluationWorkspace({
                 pendingAiResult?.page_id === page.page_id
                   ? pendingAiResult
                   : null;
-              const agentBox =
-                activeAgentReview?.page_id === page.page_id
-                  ? activeAgentReview.bbox
-                  : null;
+              const agentReviewSegments = activeAgentReviews.flatMap(
+                (review, index) =>
+                  agentReviewAreasForPage(review, page.page_id, index),
+              );
+              const agentCardPlacements = placeAgentCards(
+                activeAgentReviews,
+                agentCardPositions,
+                page.page_id,
+              );
               return (
                 <div className="answer-page-frame" key={page.page_id}>
                   <span className="page-number-label">
@@ -2351,19 +2992,62 @@ export function EvaluationWorkspace({
                       draggable={false}
                       src={resolveImageUrl(page.image_url)}
                     />
-                    {agentBox && (
-                      <div
-                        className="agent-question-box"
-                        style={{
-                          left: `${agentBox.x * 100}%`,
-                          top: `${agentBox.y * 100}%`,
-                          width: `${agentBox.w * 100}%`,
-                          height: `${agentBox.h * 100}%`,
-                        }}
-                      >
-                        <span>{activeAgentReview?.question_no}</span>
-                      </div>
-                    )}
+                    {agentReviewSegments.map((segment) => {
+                      const { review, hue, box } = segment;
+                      return (
+                        <button
+                          className={`agent-question-box ${
+                            segment.isFinal ? "final-segment" : ""
+                          }`}
+                          key={`${review.id}-${segment.areaIndex}-${page.page_id}`}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void selectQuestion(review.question_id);
+                          }}
+                          onContextMenu={(event) => event.stopPropagation()}
+                          onPointerDown={(event) => event.stopPropagation()}
+                          style={
+                            {
+                              "--agent-review-color": `hsl(${hue} 64% 43%)`,
+                              "--agent-review-fill": `hsla(${hue}, 78%, 55%, 0.2)`,
+                              left: `${box.x * 100}%`,
+                              top: `${box.y * 100}%`,
+                              width: `${box.w * 100}%`,
+                              height: `${box.h * 100}%`,
+                            } as CSSProperties
+                          }
+                          title={`Focus ${review.question_no}`}
+                          type="button"
+                        >
+                          <span>{review.question_no}</span>
+                        </button>
+                      );
+                    })}
+                    {agentCardPlacements.map((placement) => (
+                      <AgentCanvasCard
+                        deciding={agentDecisionId === placement.review.id}
+                        key={`${placement.review.id}-card`}
+                        onAccept={(review) => void acceptAgentReview(review)}
+                        onDragCancel={finishAgentCardDrag}
+                        onDragEnd={finishAgentCardDrag}
+                        onDragMove={moveAgentCardDrag}
+                        onDragStart={beginAgentCardDrag}
+                        onFocus={(review) => void selectQuestion(review.question_id)}
+                        onPositionClamp={(review, position, pinned) =>
+                          setAgentCardPositions((current) => ({
+                            ...current,
+                            [review.id]: { ...position, pinned },
+                          }))
+                        }
+                        onReject={(review) => void rejectAgentReview(review)}
+                        placement={placement}
+                        questionDetail={
+                          question?.question_id === placement.review.question_id
+                            ? question
+                            : agentQuestionDetails[placement.review.question_id]
+                        }
+                      />
+                    ))}
                     <svg
                       aria-hidden="true"
                       className="drawing-layer"
@@ -2539,106 +3223,27 @@ export function EvaluationWorkspace({
         </div>
         {question && (
           <>
-            {activeAgentReview && (
-              <section className="agent-proposal-section">
-                <article
-                  className={`agent-proposal agent-proposal-${activeAgentReview.status}`}
-                >
-                  {activeAgentReview.enhanced_image_url && (
-                    <img
-                      alt={`Enhanced answer segment for ${activeAgentReview.question_no}`}
-                      src={resolveImageUrl(activeAgentReview.enhanced_image_url)}
-                    />
-                  )}
-                  <div className="agent-proposal-body">
-                    <div className="agent-proposal-heading">
-                      <span>
-                        {activeAgentReview.area_count} enhanced{" "}
-                        {activeAgentReview.area_count === 1
-                          ? "segment"
-                          : "segments"}
-                      </span>
-                      <strong>
-                        {activeAgentReview.awarded_marks ?? 0}/
-                        {activeAgentReview.max_marks}
-                      </strong>
-                    </div>
-                    {activeAgentReview.marks && question.steps && (
-                      <div className="agent-step-marks">
-                        {question.steps.map((step, index) => (
-                          <span key={step.step_id}>
-                            <small>
-                              S{step.step_no} · {step.title}
-                            </small>
-                            <strong>
-                              {formatMark(
-                                activeAgentReview.marks?.[index] || 0,
-                              )}
-                              /{formatMark(step.max_marks)}
-                            </strong>
-                          </span>
-                        ))}
-                      </div>
-                    )}
-                    {activeAgentReview.status === "ready" && (
-                      <div className="agent-proposal-actions">
-                        <button
-                          className="agent-accept"
-                          disabled={agentDecisionId === activeAgentReview.id}
-                          onClick={() => void acceptAgentReview(activeAgentReview)}
-                          type="button"
-                        >
-                          {agentDecisionId === activeAgentReview.id
-                            ? "Applying..."
-                            : "Accept & next"}
-                        </button>
-                        <button
-                          className="agent-reject"
-                          disabled={agentDecisionId === activeAgentReview.id}
-                          onClick={() => void rejectAgentReview(activeAgentReview)}
-                          type="button"
-                        >
-                          Reject
-                        </button>
-                      </div>
-                    )}
-                    {activeAgentReview.status !== "ready" && (
-                      <p className="agent-review-outcome">
-                        {activeAgentReview.status === "accepted"
-                          ? "Accepted and applied to this question."
-                          : activeAgentReview.status === "rejected"
-                            ? "Rejected. Marks were not changed."
-                            : activeAgentReview.status === "error"
-                              ? activeAgentReview.error
-                              : "This proposal is still being prepared."}
-                      </p>
-                    )}
-                  </div>
-                </article>
-              </section>
-            )}
-            <section>
-              <h2>
-                {question.question_no}. {question.question_text}
+            <section className="question-reference-summary">
+              <h2 className="question-reference-title">
+                <span>{question.question_no}:</span>{" "}
+                {question.question_text || "Question text not provided."}
               </h2>
-              <div className="question-facts">
+              <p className="question-reference-meta">
                 <span>
-                  <small>Maximum</small>
-                  <strong>{question.max_marks} marks</strong>
+                  Max Marks:{" "}
+                  <strong>{formatMark(question.max_marks)} marks</strong>
+                </span>
+                <span className="question-reference-divider" aria-hidden="true">
+                  |
                 </span>
                 <span>
-                  <small>Steps</small>
-                  <strong>{question.total_steps}</strong>
+                  Total Steps: <strong>{question.total_steps}</strong>
                 </span>
-                <span>
-                  <small>Type</small>
-                  <strong>{question.question_type}</strong>
-                </span>
-              </div>
+              </p>
             </section>
             <section className="marking-guide read-only-guide">
               <div className="section-heading-row">
-                <p className="panel-label">Step marking guide</p>
+                <p className="panel-label">Step-wise Marking Details</p>
                 <span>
                   {question.marked_steps}/{question.total_steps}
                 </span>

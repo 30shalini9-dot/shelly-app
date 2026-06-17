@@ -17,6 +17,10 @@ UPLOAD_DIR = _resolve_path("SHELDON_UPLOAD_DIR", "data/uploads")
 AI_VISION_RUN_DIR = _resolve_path("SHELDON_AI_VISION_RUN_DIR", "data/ai_vision")
 AGENT_JOB_RUN_DIR = _resolve_path("SHELDON_AGENT_JOB_RUN_DIR", "data/agent_jobs")
 SEED_DATA = os.getenv("SHELDON_SEED_DATA", "true").lower() in {"1", "true", "yes"}
+AI_VISION_DUMMY_FULL_MARKS = os.getenv(
+    "SHELDON_AI_VISION_DUMMY_FULL_MARKS",
+    "true",
+).lower() in {"1", "true", "yes"}
 CORNERSTONE_API_URL = os.getenv(
     "SHELDON_CORNERSTONE_API_URL",
     "http://localhost:8001",

@@ -40,6 +40,7 @@ from .ai_vision import (
 from .config import (
     AGENT_DUMMY_FULL_MARKS,
     AGENT_JOB_RUN_DIR,
+    AI_VISION_DUMMY_FULL_MARKS,
     AI_VISION_RUN_DIR,
     CORNERSTONE_API_URL,
     CORNERSTONE_WEBHOOK_SECRET,
@@ -68,6 +69,40 @@ ALLOWED_IMAGE_TYPES = {
     "image/svg+xml",
 }
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+AI_VISION_DUMMY_DELAY_SECONDS = 5
+
+
+def _cornerstone_question_group_key(
+    question: dict[str, Any],
+    fallback_index: int,
+) -> str:
+    question_no = question.get("question_no")
+    if question_no is None:
+        return f"index:{fallback_index}"
+    normalized = str(question_no).strip()
+    if not normalized:
+        return f"index:{fallback_index}"
+    return f"question:{normalized}"
+
+
+def _group_cornerstone_question_segments(
+    questions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    grouped: list[dict[str, Any]] = []
+    positions: dict[str, int] = {}
+    for index, question in enumerate(questions):
+        key = _cornerstone_question_group_key(question, index)
+        raw_areas = question.get("areas")
+        areas = raw_areas if isinstance(raw_areas, list) else []
+        clean_areas = [area for area in areas if isinstance(area, dict)]
+        if key not in positions:
+            grouped_question = dict(question)
+            grouped_question["areas"] = list(clean_areas)
+            positions[key] = len(grouped)
+            grouped.append(grouped_question)
+            continue
+        grouped[positions[key]]["areas"].extend(clean_areas)
+    return grouped
 
 
 def _dummy_full_marks_result(
@@ -139,6 +174,8 @@ def create_app(
     seed_data: bool = SEED_DATA,
     ai_delay_seconds: float = 0,
     ai_evaluator: Callable[[str, str | list[str]], dict[str, Any]] | None = None,
+    ai_vision_dummy_full_marks: bool = AI_VISION_DUMMY_FULL_MARKS,
+    ai_vision_dummy_delay_seconds: float | None = None,
     ai_vision_run_dir: Path = AI_VISION_RUN_DIR,
     cornerstone_submitter: Callable[..., dict[str, Any]] | None = None,
     agent_image_fetcher: Callable[[str], tuple[bytes, str]] | None = None,
@@ -474,6 +511,8 @@ def create_app(
         questions = result.get("questions") or []
         pages = [page for page in pages if isinstance(page, dict)]
         questions = [question for question in questions if isinstance(question, dict)]
+        raw_question_count = len(questions)
+        questions = _group_cornerstone_question_segments(questions)
         detected_raw = (
             result.get("question_count")
             or result.get("detected_questions")
@@ -482,6 +521,8 @@ def create_app(
         try:
             detected = int(detected_raw) if detected_raw is not None else len(questions)
         except (TypeError, ValueError):
+            detected = len(questions)
+        if len(questions) < raw_question_count and detected == raw_question_count:
             detected = len(questions)
         return "done", detected, pages, questions, None
 
@@ -546,6 +587,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        database.AGENT_JOB_RUN_DIR = agent_job_run_dir
         database.initialize_database()
         ai_vision_run_dir.mkdir(parents=True, exist_ok=True)
         agent_job_run_dir.mkdir(parents=True, exist_ok=True)
@@ -998,15 +1040,27 @@ def create_app(
                 json.dumps(metadata, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
-            if ai_delay_seconds:
+            if ai_vision_dummy_full_marks:
+                delay_seconds = (
+                    AI_VISION_DUMMY_DELAY_SECONDS
+                    if ai_vision_dummy_delay_seconds is None
+                    else ai_vision_dummy_delay_seconds
+                )
+                if delay_seconds > 0:
+                    await asyncio.sleep(delay_seconds)
+            elif ai_delay_seconds:
                 await asyncio.sleep(ai_delay_seconds)
-            if agent_dummy_full_marks:
+            if ai_vision_dummy_full_marks:
                 result = _dummy_full_marks_result(
                     question,
                     mode="AI Vision",
                     image_count=1,
                 )
             else:
+                # Temporarily disabled for demo/testing while Agent Vision uses
+                # dummy full-mark evaluation. Keep this real Ollama path intact
+                # so it can be re-enabled without changing downstream response
+                # handling.
                 result = await asyncio.to_thread(
                     evaluate_image,
                     prompt,

@@ -69,13 +69,20 @@ class ApiTestCase(unittest.TestCase):
                 return {"status": "processing"}
             return self.cornerstone_status_payloads.pop(0)
 
+        self.ai_evaluator_calls = 0
+
+        def evaluate_ai(_prompt, _image_path):
+            self.ai_evaluator_calls += 1
+            return {
+                "marks": [0.75, 99],
+                "reasoning": "The submitted answer satisfies the criterion.",
+            }
+
         self.client_context = TestClient(
             create_app(
                 seed_data=False,
-                ai_evaluator=lambda _prompt, _image_path: {
-                    "marks": [0.75, 99],
-                    "reasoning": "The submitted answer satisfies the criterion.",
-                },
+                ai_evaluator=evaluate_ai,
+                ai_vision_dummy_delay_seconds=0,
                 ai_vision_run_dir=root / "ai_vision",
                 agent_job_run_dir=root / "agent_jobs",
                 cornerstone_submitter=submit_cornerstone,
@@ -174,6 +181,7 @@ class ApiTestCase(unittest.TestCase):
         self.assertEqual(ai_response.status_code, 201)
         self.assertEqual(ai_response.json()["marks"], [1.0])
         self.assertEqual(ai_response.json()["awarded_marks"], 1.0)
+        self.assertEqual(self.ai_evaluator_calls, 0)
         run_id = ai_response.json()["run_id"]
         run_dir = self.root / "ai_vision" / run_id
         self.assertEqual(
@@ -701,6 +709,313 @@ class ApiTestCase(unittest.TestCase):
         self.assertTrue(
             any(path.name.endswith("-cornerstone-sync.json") for path in artifact_dir.iterdir())
         )
+
+    def test_agent_review_returns_display_areas_across_page_boundary(self) -> None:
+        self.assertEqual(
+            self.client.post("/question-papers", json=PAPER).status_code,
+            201,
+        )
+        submission = self.client.post(
+            "/submissions",
+            data={
+                "student_id": "AGENT-MULTIPAGE",
+                "paper_code": "MATH-1-A",
+                "agent_mode": "true",
+            },
+            files=[
+                (
+                    "images",
+                    ("answer-1.png", b"original-page-1", "image/png"),
+                ),
+                (
+                    "images",
+                    ("answer-2.png", b"original-page-2", "image/png"),
+                ),
+            ],
+        ).json()
+        pages = self.client.get(
+            f"/evaluations/{submission['evaluation_id']}/pages"
+        ).json()
+
+        webhook = self._cornerstone_webhook(
+            {
+                "event": "cornerstone.job.done",
+                "job_id": "cornerstone-1",
+                "status": "done",
+                "data": {
+                    "question_count": 1,
+                    "questions": [
+                        {
+                            "question_no": 1,
+                            "areas": [
+                                {
+                                    "page_index": 1,
+                                    "question_image_url": (
+                                        "http://localhost:8001/v1/jobs/"
+                                        "cornerstone-1/questions/1/areas/1/image"
+                                        "?space=enhanced"
+                                    ),
+                                    "bbox": {
+                                        "normalized": {
+                                            "x1": 0.15,
+                                            "y1": 0.82,
+                                            "width": 0.5,
+                                            "height": 0.36,
+                                        }
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                },
+            }
+        )
+        self.assertEqual(webhook.status_code, 204)
+
+        agent = self.client.get(
+            f"/evaluations/{submission['evaluation_id']}/agent"
+        ).json()
+        review = agent["reviews"][0]
+        self.assertAlmostEqual(review["bbox"]["y"], 0.82)
+        self.assertAlmostEqual(review["bbox"]["h"], 0.18)
+        self.assertEqual(len(review["areas"]), 2)
+        self.assertEqual(review["areas"][0]["page_id"], pages[0]["page_id"])
+        self.assertEqual(review["areas"][1]["page_id"], pages[1]["page_id"])
+        self.assertAlmostEqual(review["areas"][0]["bbox"]["y"], 0.82)
+        self.assertAlmostEqual(review["areas"][0]["bbox"]["h"], 0.18)
+        self.assertAlmostEqual(review["areas"][1]["bbox"]["y"], 0)
+        self.assertAlmostEqual(review["areas"][1]["bbox"]["h"], 0.18)
+
+    def test_agent_review_returns_each_detected_area_across_pages(self) -> None:
+        self.assertEqual(
+            self.client.post("/question-papers", json=PAPER).status_code,
+            201,
+        )
+        submission = self.client.post(
+            "/submissions",
+            data={
+                "student_id": "AGENT-EXPLICIT-MULTIPAGE",
+                "paper_code": "MATH-1-A",
+                "agent_mode": "true",
+            },
+            files=[
+                (
+                    "images",
+                    ("answer-1.png", b"original-page-1", "image/png"),
+                ),
+                (
+                    "images",
+                    ("answer-2.png", b"original-page-2", "image/png"),
+                ),
+            ],
+        ).json()
+        pages = self.client.get(
+            f"/evaluations/{submission['evaluation_id']}/pages"
+        ).json()
+
+        webhook = self._cornerstone_webhook(
+            {
+                "event": "cornerstone.job.done",
+                "job_id": "cornerstone-1",
+                "status": "done",
+                "data": {
+                    "question_count": 1,
+                    "questions": [
+                        {
+                            "question_no": 1,
+                            "areas": [
+                                {
+                                    "page_index": 1,
+                                    "question_image_url": (
+                                        "http://localhost:8001/v1/jobs/"
+                                        "cornerstone-1/questions/1/areas/1/image"
+                                        "?space=enhanced"
+                                    ),
+                                    "bbox": {
+                                        "normalized": {
+                                            "x1": 0.1,
+                                            "y1": 0.72,
+                                            "width": 0.8,
+                                            "height": 0.28,
+                                        }
+                                    },
+                                },
+                                {
+                                    "page_index": 2,
+                                    "question_image_url": (
+                                        "http://localhost:8001/v1/jobs/"
+                                        "cornerstone-1/questions/1/areas/2/image"
+                                        "?space=enhanced"
+                                    ),
+                                    "bbox": {
+                                        "normalized": {
+                                            "x1": 0.12,
+                                            "y1": 0.0,
+                                            "width": 0.76,
+                                            "height": 0.24,
+                                        }
+                                    },
+                                },
+                            ],
+                        }
+                    ],
+                },
+            }
+        )
+        self.assertEqual(webhook.status_code, 204)
+
+        agent = self.client.get(
+            f"/evaluations/{submission['evaluation_id']}/agent"
+        ).json()
+        review = agent["reviews"][0]
+        self.assertEqual(len(review["areas"]), 2)
+        self.assertEqual(review["areas"][0]["page_id"], pages[0]["page_id"])
+        self.assertEqual(review["areas"][1]["page_id"], pages[1]["page_id"])
+        self.assertAlmostEqual(review["areas"][0]["bbox"]["y"], 0.72)
+        self.assertAlmostEqual(review["areas"][0]["bbox"]["h"], 0.28)
+        self.assertAlmostEqual(review["areas"][1]["bbox"]["y"], 0.0)
+        self.assertAlmostEqual(review["areas"][1]["bbox"]["h"], 0.24)
+
+    def test_agent_mode_groups_duplicate_question_segments(self) -> None:
+        paper = {
+            **PAPER,
+            "paper_code": "MATH-DUPLICATE-SEGMENTS",
+            "questions": [
+                {
+                    **PAPER["questions"][0],
+                    "question_no": "Q1",
+                    "display_order": 1,
+                },
+                {
+                    **PAPER["questions"][0],
+                    "question_no": "Q2",
+                    "display_order": 2,
+                },
+            ],
+        }
+        self.assertEqual(
+            self.client.post("/question-papers", json=paper).status_code,
+            201,
+        )
+        submission = self.client.post(
+            "/submissions",
+            data={
+                "student_id": "AGENT-DUPLICATE-SEGMENTS",
+                "paper_code": "MATH-DUPLICATE-SEGMENTS",
+                "agent_mode": "true",
+            },
+            files=[
+                (
+                    "images",
+                    ("answer.png", b"original-page", "image/png"),
+                )
+            ],
+        ).json()
+
+        webhook = self._cornerstone_webhook(
+            {
+                "event": "cornerstone.job.done",
+                "job_id": "cornerstone-1",
+                "status": "done",
+                "data": {
+                    "question_count": 3,
+                    "questions": [
+                        {
+                            "question_no": 1,
+                            "areas": [
+                                {
+                                    "page_index": 1,
+                                    "question_image_url": (
+                                        "http://localhost:8001/v1/jobs/"
+                                        "cornerstone-1/questions/1/areas/1/image"
+                                        "?space=enhanced"
+                                    ),
+                                    "bbox": {
+                                        "normalized": {
+                                            "x1": 0.1,
+                                            "y1": 0.1,
+                                            "width": 0.8,
+                                            "height": 0.2,
+                                        }
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "question_no": 1,
+                            "areas": [
+                                {
+                                    "page_index": 1,
+                                    "question_image_url": (
+                                        "http://localhost:8001/v1/jobs/"
+                                        "cornerstone-1/questions/1/areas/2/image"
+                                        "?space=enhanced"
+                                    ),
+                                    "bbox": {
+                                        "normalized": {
+                                            "x1": 0.12,
+                                            "y1": 0.42,
+                                            "width": 0.76,
+                                            "height": 0.18,
+                                        }
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "question_no": 2,
+                            "areas": [
+                                {
+                                    "page_index": 1,
+                                    "question_image_url": (
+                                        "http://localhost:8001/v1/jobs/"
+                                        "cornerstone-1/questions/2/areas/1/image"
+                                        "?space=enhanced"
+                                    ),
+                                    "bbox": {
+                                        "normalized": {
+                                            "x1": 0.1,
+                                            "y1": 0.7,
+                                            "width": 0.8,
+                                            "height": 0.2,
+                                        }
+                                    },
+                                }
+                            ],
+                        },
+                    ],
+                },
+            }
+        )
+        self.assertEqual(webhook.status_code, 204)
+
+        agent = self.client.get(
+            f"/evaluations/{submission['evaluation_id']}/agent"
+        ).json()
+        self.assertEqual(agent["status"], "ready")
+        self.assertEqual(agent["expected_questions"], 2)
+        self.assertEqual(agent["detected_questions"], 2)
+        self.assertEqual(agent["processed_questions"], 2)
+        self.assertEqual(agent["ready_questions"], 2)
+        self.assertEqual(
+            [review["question_no"] for review in agent["reviews"]],
+            ["Q1", "Q2"],
+        )
+
+        first_review, second_review = agent["reviews"]
+        self.assertEqual(first_review["cornerstone_question_no"], 1)
+        self.assertEqual(first_review["area_count"], 2)
+        self.assertEqual(len(first_review["areas"]), 2)
+        self.assertEqual(len(first_review["area_urls"]), 2)
+        self.assertIn("questions/1/areas/1/image", first_review["area_urls"][0])
+        self.assertIn("questions/1/areas/2/image", first_review["area_urls"][1])
+        self.assertAlmostEqual(first_review["areas"][0]["bbox"]["y"], 0.1)
+        self.assertAlmostEqual(first_review["areas"][1]["bbox"]["y"], 0.42)
+        self.assertEqual(second_review["cornerstone_question_no"], 2)
+        self.assertEqual(second_review["area_count"], 1)
+        self.assertEqual(len(second_review["areas"]), 1)
+        self.assertIn("questions/2/areas/1/image", second_review["area_urls"][0])
+        self.assertEqual(len(self.fetched_agent_images), 3)
 
     def test_cornerstone_job_uses_ocr_enabled_mode(self) -> None:
         from app.agent_workflow import submit_cornerstone_job
