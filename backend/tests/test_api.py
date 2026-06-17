@@ -69,13 +69,20 @@ class ApiTestCase(unittest.TestCase):
                 return {"status": "processing"}
             return self.cornerstone_status_payloads.pop(0)
 
+        self.ai_evaluator_calls = 0
+
+        def evaluate_ai(_prompt, _image_path):
+            self.ai_evaluator_calls += 1
+            return {
+                "marks": [0.75, 99],
+                "reasoning": "The submitted answer satisfies the criterion.",
+            }
+
         self.client_context = TestClient(
             create_app(
                 seed_data=False,
-                ai_evaluator=lambda _prompt, _image_path: {
-                    "marks": [0.75, 99],
-                    "reasoning": "The submitted answer satisfies the criterion.",
-                },
+                ai_evaluator=evaluate_ai,
+                ai_vision_dummy_delay_seconds=0,
                 ai_vision_run_dir=root / "ai_vision",
                 agent_job_run_dir=root / "agent_jobs",
                 cornerstone_submitter=submit_cornerstone,
@@ -174,6 +181,7 @@ class ApiTestCase(unittest.TestCase):
         self.assertEqual(ai_response.status_code, 201)
         self.assertEqual(ai_response.json()["marks"], [1.0])
         self.assertEqual(ai_response.json()["awarded_marks"], 1.0)
+        self.assertEqual(self.ai_evaluator_calls, 0)
         run_id = ai_response.json()["run_id"]
         run_dir = self.root / "ai_vision" / run_id
         self.assertEqual(
