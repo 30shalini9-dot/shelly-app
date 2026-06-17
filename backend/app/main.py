@@ -70,6 +70,39 @@ ALLOWED_IMAGE_TYPES = {
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 
 
+def _cornerstone_question_group_key(
+    question: dict[str, Any],
+    fallback_index: int,
+) -> str:
+    question_no = question.get("question_no")
+    if question_no is None:
+        return f"index:{fallback_index}"
+    normalized = str(question_no).strip()
+    if not normalized:
+        return f"index:{fallback_index}"
+    return f"question:{normalized}"
+
+
+def _group_cornerstone_question_segments(
+    questions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    grouped: list[dict[str, Any]] = []
+    positions: dict[str, int] = {}
+    for index, question in enumerate(questions):
+        key = _cornerstone_question_group_key(question, index)
+        raw_areas = question.get("areas")
+        areas = raw_areas if isinstance(raw_areas, list) else []
+        clean_areas = [area for area in areas if isinstance(area, dict)]
+        if key not in positions:
+            grouped_question = dict(question)
+            grouped_question["areas"] = list(clean_areas)
+            positions[key] = len(grouped)
+            grouped.append(grouped_question)
+            continue
+        grouped[positions[key]]["areas"].extend(clean_areas)
+    return grouped
+
+
 def _dummy_full_marks_result(
     question: dict[str, Any],
     *,
@@ -474,6 +507,8 @@ def create_app(
         questions = result.get("questions") or []
         pages = [page for page in pages if isinstance(page, dict)]
         questions = [question for question in questions if isinstance(question, dict)]
+        raw_question_count = len(questions)
+        questions = _group_cornerstone_question_segments(questions)
         detected_raw = (
             result.get("question_count")
             or result.get("detected_questions")
@@ -482,6 +517,8 @@ def create_app(
         try:
             detected = int(detected_raw) if detected_raw is not None else len(questions)
         except (TypeError, ValueError):
+            detected = len(questions)
+        if len(questions) < raw_question_count and detected == raw_question_count:
             detected = len(questions)
         return "done", detected, pages, questions, None
 
